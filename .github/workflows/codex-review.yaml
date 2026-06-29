@@ -35,14 +35,14 @@ jobs:
       chunk-count: ${{ steps.prepare.outputs.chunk-count }}
       chunk-matrix: ${{ steps.prepare.outputs.chunk-matrix }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event.pull_request.head.sha }} # all jobs check out the same SHA the workflow was triggered on
           fetch-depth: 0
           persist-credentials: false
 
       - id: prepare
-        uses: milanhorvatovic/codex-ai-code-review-action/prepare@0fc55cdd3d5cf9841c9ba58822354f67b6c63293 # v2.1.0-pre
+        uses: milanhorvatovic/codex-ai-code-review-action/prepare@ed60221a727aa2553f802b82d2bbe802c6e3e3d3 # v2.1.0-pre
         with:
           allow-users: milanhorvatovic # bounds OpenAI cost while the dogfood is being proven out; revisit after one release cycle
           max-chunk-bytes: ${{ vars.CODEX_MAX_CHUNK_BYTES || '204800' }}
@@ -67,13 +67,13 @@ jobs:
       fail-fast: false # one failing chunk must not cancel the others; partial output is recoverable
       matrix: ${{ fromJson(needs.prepare.outputs.chunk-matrix) }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: milanhorvatovic/codex-ai-code-review-action/review@0fc55cdd3d5cf9841c9ba58822354f67b6c63293 # v2.1.0-pre
+      - uses: milanhorvatovic/codex-ai-code-review-action/review@ed60221a727aa2553f802b82d2bbe802c6e3e3d3 # v2.1.0-pre
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           chunk: ${{ matrix.chunk }}
@@ -90,7 +90,7 @@ jobs:
       pull-requests: write
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
@@ -101,7 +101,7 @@ jobs:
           path: .codex/
           merge-multiple: true
 
-      - uses: milanhorvatovic/codex-ai-code-review-action/publish@0fc55cdd3d5cf9841c9ba58822354f67b6c63293 # v2.1.0-pre
+      - uses: milanhorvatovic/codex-ai-code-review-action/publish@ed60221a727aa2553f802b82d2bbe802c6e3e3d3 # v2.1.0-pre
         with:
           github-token: ${{ github.token }}
           expected-chunks: ${{ needs.prepare.outputs.chunk-count }}
