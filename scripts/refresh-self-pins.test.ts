@@ -1,38 +1,39 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  refreshDoc,
   refreshReadme,
   refreshWorkflow,
-  removeIssue44Paragraph,
+  rewriteAllPlaceholderPins,
   rewriteAllSelfPins,
   rewriteSelfPin,
   rewriteShaTagNote,
   runCli,
-  uncommentFailOnMissingChunks,
 } from "./refresh-self-pins.js";
+import { SELF_REPO } from "./self-repo.js";
 
 const NEW_SHA = "1111111111111111111111111111111111111111";
 const OLD_SHA = "af72a5bd7330432cee97137b04d04edebde80149";
 
 describe("rewriteSelfPin", () => {
   it("rewrites a top-level self-reference", () => {
-    const line = `      uses: milanhorvatovic/codex-ai-code-review-action@${OLD_SHA} # v2.0.0`;
+    const line = `      uses: ${SELF_REPO}@${OLD_SHA} # v2.0.0`;
     expect(rewriteSelfPin(line, "2.1.0", NEW_SHA)).toBe(
-      `      uses: milanhorvatovic/codex-ai-code-review-action@${NEW_SHA} # v2.1.0`,
+      `      uses: ${SELF_REPO}@${NEW_SHA} # v2.1.0`,
     );
   });
 
   it("rewrites a sub-action self-reference", () => {
-    const line = `      uses: milanhorvatovic/codex-ai-code-review-action/prepare@${OLD_SHA} # v2.0.0`;
+    const line = `      uses: ${SELF_REPO}/prepare@${OLD_SHA} # v2.0.0`;
     expect(rewriteSelfPin(line, "2.1.0", NEW_SHA)).toBe(
-      `      uses: milanhorvatovic/codex-ai-code-review-action/prepare@${NEW_SHA} # v2.1.0`,
+      `      uses: ${SELF_REPO}/prepare@${NEW_SHA} # v2.1.0`,
     );
   });
 
   it("appends a tag comment when none was present", () => {
-    const line = `      uses: milanhorvatovic/codex-ai-code-review-action@${OLD_SHA}`;
+    const line = `      uses: ${SELF_REPO}@${OLD_SHA}`;
     expect(rewriteSelfPin(line, "2.1.0", NEW_SHA)).toBe(
-      `      uses: milanhorvatovic/codex-ai-code-review-action@${NEW_SHA} # v2.1.0`,
+      `      uses: ${SELF_REPO}@${NEW_SHA} # v2.1.0`,
     );
   });
 
@@ -42,7 +43,7 @@ describe("rewriteSelfPin", () => {
   });
 
   it("leaves @v2-style floating tags untouched", () => {
-    const line = `      uses: milanhorvatovic/codex-ai-code-review-action@v2`;
+    const line = `      uses: ${SELF_REPO}@v2`;
     expect(rewriteSelfPin(line, "2.1.0", NEW_SHA)).toBe(line);
   });
 
@@ -63,9 +64,9 @@ describe("rewriteAllSelfPins", () => {
   it("rewrites every self-reference and leaves others untouched", () => {
     const content = [
       `      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2`,
-      `      uses: milanhorvatovic/codex-ai-code-review-action/prepare@${OLD_SHA} # v2.0.0`,
-      `      uses: milanhorvatovic/codex-ai-code-review-action/review@${OLD_SHA} # v2.0.0`,
-      `      uses: milanhorvatovic/codex-ai-code-review-action/publish@${OLD_SHA} # v2.0.0`,
+      `      uses: ${SELF_REPO}/prepare@${OLD_SHA} # v2.0.0`,
+      `      uses: ${SELF_REPO}/review@${OLD_SHA} # v2.0.0`,
+      `      uses: ${SELF_REPO}/publish@${OLD_SHA} # v2.0.0`,
     ].join("\n");
     const result = rewriteAllSelfPins(content, "2.1.0", NEW_SHA);
     expect(result.split("\n")[0]).toContain("actions/checkout@");
@@ -74,75 +75,65 @@ describe("rewriteAllSelfPins", () => {
   });
 });
 
-describe("uncommentFailOnMissingChunks", () => {
-  it("uncomments the line and strips the scaffolding comment", () => {
+describe("rewriteAllPlaceholderPins", () => {
+  it("bumps the trailing tag comment on a `<full-sha>` placeholder pin", () => {
+    const line = `  uses: ${SELF_REPO}/prepare@<full-sha> # v2.0.0`;
+    expect(rewriteAllPlaceholderPins(line, "2.1.0")).toBe(
+      `  uses: ${SELF_REPO}/prepare@<full-sha> # v2.1.0`,
+    );
+  });
+
+  it("rewrites every placeholder self-reference in a multi-line block", () => {
     const content = [
-      `          retain-findings: false # explicit for auditors; matches the action default`,
-      `          # fail-on-missing-chunks: "true" # available in the next tagged release; uncomment after bumping the SHAs above`,
+      `  uses: ${SELF_REPO}/prepare@<full-sha> # v2.0.0`,
+      `- uses: ${SELF_REPO}/review@<full-sha> # v2.0.0`,
+      `- uses: ${SELF_REPO}/publish@<full-sha> # v2.0.0`,
     ].join("\n");
-    const result = uncommentFailOnMissingChunks(content);
-    expect(result.split("\n")[1]).toBe(`          fail-on-missing-chunks: "true"`);
+    const result = rewriteAllPlaceholderPins(content, "2.1.0");
+    expect((result.match(/# v2\.1\.0(?!-)/g) ?? []).length).toBe(3);
+    expect(result).not.toContain("# v2.0.0");
+    expect((result.match(/@<full-sha>/g) ?? []).length).toBe(3);
   });
 
-  it("uncomments the bare commented form (no trailing 'next tagged release' note)", () => {
-    const content = [
-      `          retain-findings: "false"`,
-      `          # fail-on-missing-chunks: "true"`,
-    ].join("\n");
-    const result = uncommentFailOnMissingChunks(content);
-    expect(result.split("\n")[1]).toBe(`          fail-on-missing-chunks: "true"`);
+  it("appends a tag comment when none was present on a placeholder pin", () => {
+    const line = `  uses: ${SELF_REPO}/prepare@<full-sha>`;
+    expect(rewriteAllPlaceholderPins(line, "2.1.0")).toBe(
+      `  uses: ${SELF_REPO}/prepare@<full-sha> # v2.1.0`,
+    );
   });
 
-  it("leaves the file unchanged when the commented form is absent", () => {
-    const content = `          fail-on-missing-chunks: "true"`;
-    expect(uncommentFailOnMissingChunks(content)).toBe(content);
-  });
-});
-
-describe("removeIssue44Paragraph", () => {
-  it("removes the paragraph and one surrounding blank line", () => {
-    const content = [
-      "previous content",
-      "",
-      "When you adopt a release that contains [issue #44](https://example), bump the SHAs.",
-      "",
-      "next content",
-      "",
-    ].join("\n");
-    const result = removeIssue44Paragraph(content);
-    expect(result).not.toContain("issue #44");
-    expect(result).toContain("previous content");
-    expect(result).toContain("next content");
-    expect(result).not.toContain("\n\n\n");
+  it("leaves prose mentions of `<full-sha>` (no owner prefix) untouched", () => {
+    const line = "Replace `<full-sha>` with its commit SHA.";
+    expect(rewriteAllPlaceholderPins(line, "2.1.0")).toBe(line);
   });
 
-  it("returns the input unchanged when the paragraph is absent", () => {
-    const content = "no issue 44 mention here\n";
-    expect(removeIssue44Paragraph(content)).toBe(content);
+  it("leaves third-party fork-mirror placeholder pins untouched", () => {
+    const line = "  uses: <org>/codex-ai-code-review-action-fork/prepare@<full-sha> # v2.1.0-rc.1";
+    expect(rewriteAllPlaceholderPins(line, "2.1.0")).toBe(line);
   });
 
-  it("removes the paragraph when it is the last text in the file (no trailing newline)", () => {
-    const content = [
-      "previous content",
-      "",
-      "When you adopt a release that contains [issue #44](https://example), bump the SHAs.",
-    ].join("\n");
-    const result = removeIssue44Paragraph(content);
-    expect(result).not.toContain("issue #44");
-    expect(result).toContain("previous content");
-    expect(result).not.toContain("\n\n\n");
-  });
-
-  it("removes the paragraph when it is the only text in the file", () => {
-    const content =
-      "When you adopt a release that contains [issue #44](https://example), bump the SHAs.";
-    expect(removeIssue44Paragraph(content)).toBe("");
+  it("rejects a malformed version string", () => {
+    expect(() => rewriteAllPlaceholderPins("noop", "v2.1.0")).toThrow(/Strip the leading 'v'/);
   });
 });
 
 describe("rewriteShaTagNote", () => {
   it("updates the inline 'SHA corresponds to tag vX.Y.Z' note", () => {
     const content = "        # SHA corresponds to tag v2.0.0 — update when adopting a new release.";
+    expect(rewriteShaTagNote(content, "2.1.0")).toBe(
+      "        # SHA corresponds to tag v2.1.0 — update when adopting a new release.",
+    );
+  });
+
+  it("rewrites a pre-release-suffixed source note to the stable target version", () => {
+    const content = "        # SHA corresponds to tag v2.1.0-rc.1 — update when adopting a new release.";
+    expect(rewriteShaTagNote(content, "2.1.0")).toBe(
+      "        # SHA corresponds to tag v2.1.0 — update when adopting a new release.",
+    );
+  });
+
+  it("rewrites a pre-release identifier that contains hyphens", () => {
+    const content = "        # SHA corresponds to tag v2.1.0-rc-hotfix.1 — update when adopting a new release.";
     expect(rewriteShaTagNote(content, "2.1.0")).toBe(
       "        # SHA corresponds to tag v2.1.0 — update when adopting a new release.",
     );
@@ -155,36 +146,61 @@ describe("rewriteShaTagNote", () => {
 });
 
 describe("refreshReadme", () => {
-  it("applies SHA refresh, uncomments fail-on-missing-chunks, and strips the issue-44 paragraph in one pass", () => {
+  it("applies SHA refresh and tag-note rewrite in one pass", () => {
     const content = [
       "# Project",
       "",
-      `      uses: milanhorvatovic/codex-ai-code-review-action/publish@${OLD_SHA} # v2.0.0`,
-      `        with:`,
-      `          retain-findings: false # explicit`,
-      `          # fail-on-missing-chunks: "true" # available in the next tagged release; uncomment after bumping the SHAs above`,
-      "```",
-      "",
-      "When you adopt a release that contains [issue #44](https://example), bump the SHAs.",
+      `      uses: ${SELF_REPO}/publish@${OLD_SHA} # v2.0.0`,
+      `        # SHA corresponds to tag v2.0.0 — update when adopting a new release.`,
       "",
       "## Architecture",
       "",
     ].join("\n");
     const result = refreshReadme(content, "2.1.0", NEW_SHA);
     expect(result).toContain(`@${NEW_SHA} # v2.1.0`);
-    expect(result).toContain(`fail-on-missing-chunks: "true"`);
-    expect(result).not.toContain("available in the next tagged release");
-    expect(result).not.toContain("issue #44");
+    expect(result).toContain("# SHA corresponds to tag v2.1.0 —");
     expect(result).toContain("## Architecture");
+  });
+
+  it("bumps placeholder-pin tag comments alongside real-SHA pins", () => {
+    const content = [
+      `      uses: ${SELF_REPO}/prepare@${OLD_SHA} # v2.0.0`,
+      "",
+      `- uses: ${SELF_REPO}/review@<full-sha> # v2.0.0`,
+      `- uses: ${SELF_REPO}/publish@<full-sha> # v2.0.0`,
+    ].join("\n");
+    const result = refreshReadme(content, "2.1.0", NEW_SHA);
+    expect(result).toContain(`@${NEW_SHA} # v2.1.0`);
+    expect(result).toContain(`@<full-sha> # v2.1.0`);
+    expect(result).not.toContain("v2.0.0");
+  });
+});
+
+describe("refreshDoc", () => {
+  it("rewrites both real-SHA and placeholder pins in a docs page", () => {
+    const content = [
+      `- uses: ${SELF_REPO}/prepare@<full-sha> # v2.0.0`,
+      `- uses: ${SELF_REPO}/review@<full-sha> # v2.0.0`,
+      `      uses: ${SELF_REPO}/publish@${OLD_SHA} # v2.0.0`,
+    ].join("\n");
+    const result = refreshDoc(content, "2.1.0", NEW_SHA);
+    expect((result.match(/@<full-sha> # v2\.1\.0(?!-)/g) ?? []).length).toBe(2);
+    expect(result).toContain(`@${NEW_SHA} # v2.1.0`);
+    expect(result).not.toContain("v2.0.0");
+  });
+
+  it("does not touch the SHA-tag-note phrase (only README uses that note)", () => {
+    const content = "# SHA corresponds to tag v2.0.0 — update when adopting a new release.";
+    expect(refreshDoc(content, "2.1.0", NEW_SHA)).toBe(content);
   });
 });
 
 describe("refreshWorkflow", () => {
   it("rewrites every self-reference SHA and tag comment in a workflow file", () => {
     const content = [
-      `      uses: milanhorvatovic/codex-ai-code-review-action/prepare@${OLD_SHA} # v2.1.0-pre`,
-      `      uses: milanhorvatovic/codex-ai-code-review-action/review@${OLD_SHA} # v2.1.0-pre`,
-      `      uses: milanhorvatovic/codex-ai-code-review-action/publish@${OLD_SHA} # v2.1.0-pre`,
+      `      uses: ${SELF_REPO}/prepare@${OLD_SHA} # v2.1.0-pre`,
+      `      uses: ${SELF_REPO}/review@${OLD_SHA} # v2.1.0-pre`,
+      `      uses: ${SELF_REPO}/publish@${OLD_SHA} # v2.1.0-pre`,
     ].join("\n");
     const result = refreshWorkflow(content, "2.1.0", NEW_SHA);
     expect(result).not.toContain(OLD_SHA);
@@ -214,6 +230,7 @@ describe("runCli", () => {
 
   const README_PATH = "README.md";
   const WORKFLOW_PATH = ".github/workflows/codex-review.yaml";
+  const DOC_PATH = "docs/consumer-controls.md";
 
   function makeDeps(stub: Stub, argv: string[]) {
     return {
@@ -238,8 +255,9 @@ describe("runCli", () => {
   it("returns 0 and writes both targets when both have outdated SHAs", () => {
     const stub: Stub = {
       files: {
-        [README_PATH]: `      uses: milanhorvatovic/codex-ai-code-review-action@${OLD_SHA} # v2.0.0`,
-        [WORKFLOW_PATH]: `      uses: milanhorvatovic/codex-ai-code-review-action/prepare@${OLD_SHA} # v2.1.0-pre`,
+        [README_PATH]: `      uses: ${SELF_REPO}@${OLD_SHA} # v2.0.0`,
+        [WORKFLOW_PATH]: `      uses: ${SELF_REPO}/prepare@${OLD_SHA} # v2.1.0-pre`,
+        [DOC_PATH]: "",
       },
       writes: [],
       stdout: [],
@@ -252,11 +270,35 @@ describe("runCli", () => {
     }
   });
 
+  it("writes the docs target when its placeholder-pin tag comments are outdated", () => {
+    const stub: Stub = {
+      files: {
+        [README_PATH]: `      uses: ${SELF_REPO}@${NEW_SHA} # v2.1.0`,
+        [WORKFLOW_PATH]: `      uses: ${SELF_REPO}/prepare@${NEW_SHA} # v2.1.0`,
+        [DOC_PATH]: [
+          `- uses: ${SELF_REPO}/prepare@<full-sha> # v2.0.0`,
+          `- uses: ${SELF_REPO}/review@<full-sha> # v2.0.0`,
+          `- uses: ${SELF_REPO}/publish@<full-sha> # v2.0.0`,
+        ].join("\n"),
+      },
+      writes: [],
+      stdout: [],
+      stderr: [],
+    };
+    expect(runCli(makeDeps(stub, ["2.1.0", NEW_SHA]))).toBe(0);
+    expect(stub.writes).toHaveLength(1);
+    expect(stub.writes[0]?.path).toBe(DOC_PATH);
+    const written = stub.writes[0]?.content ?? "";
+    expect((written.match(/@<full-sha> # v2\.1\.0(?!-)/g) ?? []).length).toBe(3);
+    expect(written).not.toContain("v2.0.0");
+  });
+
   it("writes only the workflow file when README is already up to date", () => {
     const stub: Stub = {
       files: {
-        [README_PATH]: `      uses: milanhorvatovic/codex-ai-code-review-action@${NEW_SHA} # v2.1.0`,
-        [WORKFLOW_PATH]: `      uses: milanhorvatovic/codex-ai-code-review-action/prepare@${OLD_SHA} # v2.1.0-pre`,
+        [README_PATH]: `      uses: ${SELF_REPO}@${NEW_SHA} # v2.1.0`,
+        [WORKFLOW_PATH]: `      uses: ${SELF_REPO}/prepare@${OLD_SHA} # v2.1.0-pre`,
+        [DOC_PATH]: "",
       },
       writes: [],
       stdout: [],
@@ -271,8 +313,9 @@ describe("runCli", () => {
   it("writes only README when the workflow file is already up to date", () => {
     const stub: Stub = {
       files: {
-        [README_PATH]: `      uses: milanhorvatovic/codex-ai-code-review-action@${OLD_SHA} # v2.0.0`,
-        [WORKFLOW_PATH]: `      uses: milanhorvatovic/codex-ai-code-review-action/prepare@${NEW_SHA} # v2.1.0`,
+        [README_PATH]: `      uses: ${SELF_REPO}@${OLD_SHA} # v2.0.0`,
+        [WORKFLOW_PATH]: `      uses: ${SELF_REPO}/prepare@${NEW_SHA} # v2.1.0`,
+        [DOC_PATH]: "",
       },
       writes: [],
       stdout: [],
@@ -287,8 +330,9 @@ describe("runCli", () => {
   it("returns 0 without writing when no edits are required across all targets", () => {
     const stub: Stub = {
       files: {
-        [README_PATH]: `      uses: milanhorvatovic/codex-ai-code-review-action@${NEW_SHA} # v2.1.0`,
-        [WORKFLOW_PATH]: `      uses: milanhorvatovic/codex-ai-code-review-action/prepare@${NEW_SHA} # v2.1.0`,
+        [README_PATH]: `      uses: ${SELF_REPO}@${NEW_SHA} # v2.1.0`,
+        [WORKFLOW_PATH]: `      uses: ${SELF_REPO}/prepare@${NEW_SHA} # v2.1.0`,
+        [DOC_PATH]: `- uses: ${SELF_REPO}/prepare@<full-sha> # v2.1.0`,
       },
       writes: [],
       stdout: [],
@@ -310,6 +354,7 @@ describe("runCli", () => {
       files: {
         [README_PATH]: "no pins here",
         [WORKFLOW_PATH]: "no pins here either",
+        [DOC_PATH]: "no pins here either",
       },
       writes: [],
       stdout: [],
@@ -322,7 +367,7 @@ describe("runCli", () => {
   it("does not write any target when a later read fails", () => {
     const stub: Stub = {
       files: {
-        [README_PATH]: `      uses: milanhorvatovic/codex-ai-code-review-action@${OLD_SHA} # v2.0.0`,
+        [README_PATH]: `      uses: ${SELF_REPO}@${OLD_SHA} # v2.0.0`,
         // WORKFLOW_PATH intentionally absent so reading it throws after README has been refreshed.
       },
       writes: [],
@@ -335,10 +380,10 @@ describe("runCli", () => {
   });
 
   it("rolls back earlier writes and the in-flight file when a later write throws", () => {
-    const readmeOriginal = `      uses: milanhorvatovic/codex-ai-code-review-action@${OLD_SHA} # v2.0.0`;
-    const workflowOriginal = `      uses: milanhorvatovic/codex-ai-code-review-action/prepare@${OLD_SHA} # v2.1.0-pre`;
+    const readmeOriginal = `      uses: ${SELF_REPO}@${OLD_SHA} # v2.0.0`;
+    const workflowOriginal = `      uses: ${SELF_REPO}/prepare@${OLD_SHA} # v2.1.0-pre`;
     const stub: Stub = {
-      files: { [README_PATH]: readmeOriginal, [WORKFLOW_PATH]: workflowOriginal },
+      files: { [README_PATH]: readmeOriginal, [WORKFLOW_PATH]: workflowOriginal, [DOC_PATH]: "" },
       writes: [],
       stdout: [],
       stderr: [],
@@ -377,10 +422,10 @@ describe("runCli", () => {
   });
 
   it("surfaces the original write error when rollback writes also fail", () => {
-    const readmeOriginal = `      uses: milanhorvatovic/codex-ai-code-review-action@${OLD_SHA} # v2.0.0`;
-    const workflowOriginal = `      uses: milanhorvatovic/codex-ai-code-review-action/prepare@${OLD_SHA} # v2.1.0-pre`;
+    const readmeOriginal = `      uses: ${SELF_REPO}@${OLD_SHA} # v2.0.0`;
+    const workflowOriginal = `      uses: ${SELF_REPO}/prepare@${OLD_SHA} # v2.1.0-pre`;
     const stub: Stub = {
-      files: { [README_PATH]: readmeOriginal, [WORKFLOW_PATH]: workflowOriginal },
+      files: { [README_PATH]: readmeOriginal, [WORKFLOW_PATH]: workflowOriginal, [DOC_PATH]: "" },
       writes: [],
       stdout: [],
       stderr: [],

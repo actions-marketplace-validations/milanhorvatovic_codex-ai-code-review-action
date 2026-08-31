@@ -29,7 +29,7 @@ Every `uses:` reference to this action in your workflow must use a 40-character 
 
 **Why:** SHA pinning is GitHub's recommended supply-chain control for third-party actions. A mutable tag like `@v2` is a maintainer-account-controlled reference that can be moved at any time; a SHA freezes the exact code you reviewed, including the transitive `openai/codex-action` pin in [`review/action.yaml`](../review/action.yaml).
 
-**Example.** Resolve the SHA for the release tag you want to adopt, then pin all three sub-actions to that single SHA. Replace `<tag>` with the release (e.g. `v2.1.0`) and `<full-sha>` with the resolved 40-character commit SHA:
+**Example.** Resolve the SHA for the release tag you want to adopt, then pin all three sub-actions to that single SHA. Replace `<tag>` with the release tag you want to pin and `<full-sha>` with the resolved 40-character commit SHA:
 
 ```bash
 gh api repos/milanhorvatovic/codex-ai-code-review-action/commits/<tag> --jq '.sha'
@@ -42,7 +42,7 @@ gh api repos/milanhorvatovic/codex-ai-code-review-action/commits/<tag> --jq '.sh
 - uses: milanhorvatovic/codex-ai-code-review-action/publish@<full-sha> # v2.1.0
 ```
 
-The `# v2.1.0` trailing comment is for human readers; pin verification reads the SHA, not the comment. Bumping to a new release is a one-line edit per `uses:` line plus a re-run of the `gh api` command.
+The trailing `# vX.Y.Z` comment is for human readers; pin verification reads the SHA, not the comment. Bumping to a new release is a one-line edit per `uses:` line plus a re-run of the `gh api` command.
 
 **How to apply:** see [Pinning the action](../README.md#pinning-the-action) for the full convenient-vs-immutable comparison and the transitive-pin guarantee, and the [Production workflow example](../README.md#production-workflow-example) for a complete workflow that has all three sub-actions pinned to the same SHA in context.
 
@@ -108,36 +108,76 @@ The action defaults `retain-findings` to `false`. Production workflows should le
 
 **How to apply:** the [Production workflow example](../README.md#production-workflow-example) sets `retain-findings: false` explicitly so an auditor reading the workflow file sees the choice was deliberate. See the [Publish action inputs](../README.md#publish-action-inputs) table for the input definition and the upstream cap behavior of `retain-findings-days`.
 
-### 8. Set `fail-on-missing-chunks: "true"` for v2.1+
+### 8. Verify `fail-on-missing-chunks` default; do not override to `"false"` without documented consent
+
+> **Owner:** Upstream default; consumer must not override without approval.
+
+From v2.1.0 onward, `fail-on-missing-chunks` defaults to `"true"`: when any expected chunk is missing, the publish step fails red after publishing the partial review. Production workflows should leave this default in place. Setting it to `"false"` is allowed only as an explicit, documented team decision — annotate the override on the workflow line so an auditor can see the choice was deliberate, not a default copy-paste.
+
+**Important: the input is recognized only on SHAs from the v2.1.0 line (v2.1.0-rc.1 or later).** If the SHAs are still on `@v2.0.0` (or any commit before the v2.1.0 line), GitHub emits an `Unexpected input(s)` warning and silently ignores the value, falling back to the v2.0.x behavior in which a missing chunk silently passed. Pin to v2.1.0-rc.1 (or later) first; the default-on protection only applies once the SHAs are bumped.
+
+**Why:** when one or more review chunks are missing (job failure, invalid output, artifact lost), the partial review is always published with an "Incomplete review" banner. With `fail-on-missing-chunks: false`, the publish step still exits 0 — CI status stays green, and a reviewer who sees "Codex review posted" may miss the banner and assume full diff coverage. With the default `true`, the same banner is posted **and** the publish step then fails, so the missing-chunks case surfaces as a red CI check on the PR rather than a green one with the warning buried in the body.
+
+**How to apply:** see the [Publish action inputs](../README.md#publish-action-inputs) table for the input definition and the `Unexpected input(s)` warning note for pre-v2.1.0 SHAs. The [Production workflow example](../README.md#production-workflow-example) sets `fail-on-missing-chunks: "true"` explicitly so an auditor reading the workflow file sees the choice was deliberate.
+
+### 9. Pass `review-reference-file` only with `review-reference-source: base`
 
 > **Owner:** Consumer responsibility.
 
-Once `prepare`, `review`, and `publish` are pinned to a v2.1.0-or-later SHA, the `publish` job must set `fail-on-missing-chunks: "true"`. This is the steady-state production setting from v2.1.0 onward.
+The default — and the recommended setting — is to **not pass `review-reference-file` at all**. The action ships a built-in default reference at [`defaults/review-reference.md`](../defaults/review-reference.md) that is frozen at the SHA you pinned this action to and is therefore immutable from a consuming PR's perspective.
 
-**Important: the input is recognized only on v2.1.0 and later.** If the SHAs are still on `@v2.0.0` (or any pre-v2.1.0 commit), GitHub emits an `Unexpected input(s)` warning and silently ignores the value. A consumer who copies this checklist line without first bumping the SHAs gets neither the protection nor a hard failure — only a warning buried in the workflow log. Pin to v2.1.0+ first, then enable the input.
+If you do customize the reference, the rule has two strict halves:
 
-**Why:** when one or more review chunks are missing (job failure, invalid output, artifact lost), the partial review is always published with an "Incomplete review" banner. With the default `fail-on-missing-chunks: false`, the publish step still exits 0 — CI status stays green, and a reviewer who sees "Codex review posted" may miss the banner and assume full diff coverage. With `true`, the same banner is posted **and** the publish step then fails, so the missing-chunks case surfaces as a red CI check on the PR rather than a green one with the warning buried in the body.
+- **Wrappers (`workflow_call`)**: hard-code `review-reference-source: base` in the wrapped `prepare` step's `with:` block. Do **not** expose `review-reference-source` as a `workflow_call` input — defaults on reusable-workflow inputs are caller-controlled, so a product repo could pass `workspace` and silently re-enable PR-controlled policy reads. If a wrapper has a narrow reason to expose the input, validate-and-reject any value other than `base` before invoking `prepare`. This matches the "Expose only with `review-reference-source: base` hard-coded in the wrapped step" category in the wrapper input-surface guidance — see [Extending the wrapper's input surface](../README.md#extending-the-wrappers-input-surface).
+- **Direct consumers (`pull_request`)**: pass `review-reference-source: base` alongside `review-reference-file`. Workspace mode (the default) is allowed only when the consuming repo explicitly accepts that same-repo PR authors can steer the policy of their own PR's review; document that consent in a comment on the workflow line so an auditor can see the decision was deliberate, not a default copy-paste.
 
-The default remains `false` for backward compatibility — flipping it in a v2.x minor release would change the CI status of a workflow that previously stayed green. The explicit recommendation to set it to `"true"` exists precisely because the default does not.
+**Why:** in workspace mode the reference file is checked out from `${{ github.event.pull_request.head.sha }}`. A same-repo PR author can include an edit to `.github/codex/review-reference.md` in the same PR and steer the review of that very PR — before any code-owner review can land, because the workflow runs on PR head, not on the merged result. The path-shape hardening codified in [`src/prepare/referenceFile.ts`](../src/prepare/referenceFile.ts) closes the file-disclosure path (no symlinks, no traversal, no `.git`, ≤64 KiB, regular file only) but does not pin the policy file's source. `review-reference-source: base` reads the file at the PR base SHA via `git --literal-pathspecs ls-tree` (for the tree-entry mode, used to reject tracked symlinks and submodules; `--literal-pathspecs` is a git global option and must precede the subcommand) and `git cat-file blob` (for the content), so an in-flight PR cannot edit policy that applies to its own review; policy *content* still lives in the consumer repo and is controlled by whoever can land changes on the base branch.
 
-**How to apply:** see the [Publish action inputs](../README.md#publish-action-inputs) table for the v2.1.0 behavior contract and the `Unexpected input(s)` warning note. The [Production workflow example](../README.md#production-workflow-example) shows the line uncommented after the action is pinned to v2.1.0.
+**How to apply:** see [Customizing review rules per repository](../README.md#customizing-review-rules-per-repository) and [Choosing a `review-reference-source`](../README.md#choosing-a-review-reference-source) for the mode trade-off, and [Constraints on `review-reference-file`](../README.md#constraints-on-review-reference-file) for the path-shape rules. The callout in the [Production workflow example](../README.md#production-workflow-example) restates the trust trade-off. For wrappers, [Extending the wrapper's input surface](../README.md#extending-the-wrappers-input-surface) is the canonical reference.
 
-### 9. Do not pass `review-reference-file` until `review-reference-source: base` is available and enabled
+### 10. Optional: tune `exclude-paths` for token cost, not as a security control
 
-> **Owner:** Consumer responsibility.
+> **Owner:** Optional; consumer responsibility when used.
 
-The default — and the recommended setting — is to **not pass `review-reference-file` at all**. The action ships a built-in default reference at [`defaults/review-reference.md`](../defaults/review-reference.md) that is frozen at the SHA you pinned this action to and is therefore immutable from a consuming PR's perspective. Both direct and wrapper consumers should rely on it until tamper-resistant base-mode reads ship in [issue #97](https://github.com/milanhorvatovic/codex-ai-code-review-action/issues/97).
+`exclude-paths` is the only item in this checklist that is genuinely optional — every other item is a hard constraint. Skip this item entirely if your workflow does not set `exclude-paths`; the empty default preserves the original behavior of reviewing every file in the diff. It is included here so an auditor reading the workflow file in one pass has a single document covering every prepare-step input.
 
-The rule has two strict halves:
+**What it does.** When set, the prepare step passes each entry to `git diff` as a `:(exclude)<glob>` pathspec. The resulting diff omits matching files before chunking — no OpenAI tokens spent on generated artifacts (`dist/`), lockfiles, or other content with no review value. Unmatched entries no-op silently; an entry like `dist/**` does not need to be removed when a particular PR did not touch `dist/`.
 
-- **Wrappers (`workflow_call`)**: do **not** expose `review-reference-file` as a `workflow_call` input. There is no exception. This matches the "Defer until `review-reference-source: base` ships" category in the wrapper input-surface guidance — see [Extending the wrapper's input surface](../README.md#extending-the-wrappers-input-surface).
-- **Direct consumers (`pull_request`)**: passing `review-reference-file` in workspace mode is allowed only when the consuming repo explicitly accepts that same-repo PR authors can steer the policy of their own PR's review. Document the consent in a comment on the workflow line so an auditor can see the decision was deliberate, not a default copy-paste.
+#### What it is *not*
 
-**Why:** in the only mode that exists today (workspace mode), the reference file is checked out from `${{ github.event.pull_request.head.sha }}`. A same-repo PR author can include an edit to `.github/codex/review-reference.md` in the same PR and steer the review of that very PR — before any code-owner review can land, because the workflow runs on PR head, not on the merged result. The hardening from PR [#98](https://github.com/milanhorvatovic/codex-ai-code-review-action/pull/98) closes the file-disclosure path (no symlinks, no traversal, no `.git`, ≤64 KiB, regular file only) but does not pin the policy file's source to the base branch. Until [issue #97](https://github.com/milanhorvatovic/codex-ai-code-review-action/issues/97) ships, workspace mode is PR-controlled by design.
+This is a **cost optimization**, not a security control:
 
-**Future state (after #97 ships):** the rule changes to "if you pass `review-reference-file`, you must also set `review-reference-source: base`." At that point the input becomes safe to expose from wrappers as well, with `base` as the wrapper's locked default.
+- **Does not gate which workflow runs trigger.** That is `on.pull_request.paths-ignore:` at the trigger level (item 2's trigger choice) plus the same-repo gate (item 3). A workflow already running on a fork or draft is not protected by `exclude-paths` — `prepare` only parses the input after the workflow has been scheduled.
+- **Does not constrain who can trigger reviews.** That is `allow-users`.
+- **Does not affect what the model treats as review policy.** Policy comes from `review-reference-file` (item 9) and the built-in default; `exclude-paths` only narrows the diff fed to the model.
 
-**How to apply:** see [Customizing review rules per repository](../README.md#customizing-review-rules-per-repository) and [Constraints on `review-reference-file`](../README.md#constraints-on-review-reference-file) for the workspace-safety constraints in force today, and the callout in the [Production workflow example](../README.md#production-workflow-example) for the workspace-mode tamper-resistance gap. For wrappers, [Extending the wrapper's input surface](../README.md#extending-the-wrappers-input-surface) is the canonical reference.
+If you need to skip whole runs, use `paths-ignore:` at the trigger level — the workflow does not start, no compute is spent. Use `exclude-paths` only when the workflow *should* run (the PR also touches reviewable code) and you want to drop a subset of the diff from review.
+
+#### Validation rules
+
+The action validates every entry before `git diff` runs. It fails the entire run with `Invalid exclude-paths: <reason>` if any entry:
+
+| Rule | Why |
+|---|---|
+| Contains a NUL byte | NUL is a C-string terminator; on POSIX it would truncate the argv element passed to `git`, silently widening the exclusion scope from `:(exclude)foo\0bar` to `:(exclude)foo`. |
+| Contains a backslash (`\`) | Windows separator + magic-prefix evasion. POSIX only. |
+| Starts with `:` | Pathspec magic prefix; the action prepends `:(exclude)` itself, and allowing consumer-supplied magic would let a misuse swap exclusion for inclusion or alter pathspec scope. |
+| Starts with `/` | Absolute path; use workspace-relative patterns. |
+| Contains a `..` segment | Anywhere — `../foo`, `foo/../bar`. Defensive against escape-style patterns. |
+
+Plus: a hard cap of **64 entries**; exceeding it fails closed with the entry count in the message.
+
+Empty input and whitespace-only input are treated as if the input was not provided at all — no pathspec args appended, current behavior preserved. Blank lines and CR characters from CRLF line endings are dropped silently. Trailing newlines and Windows-style line endings need no special handling.
+
+#### Why the 64-entry cap
+
+The cap is a defensive bound, not a hard performance constraint. Real-world artifact-exclusion lists fit well inside 64 entries (`dist/**`, `vendor/**`, `package-lock.json` / `yarn.lock` / `pnpm-lock.yaml`, `build/**`, `generated/**`, plus a handful of extension globs covers most repositories). The cap prevents accidental misuse — e.g. a consumer piping a file list (`find dist -type f`) into the input, which would balloon the `git diff` command line and obscure intent. If you legitimately need more, the underlying problem is usually solved better by a different design: a file-extension allowlist, a separate review scope per directory, or a wrapper that splits the workflow into multiple `prepare` invocations.
+
+#### Wrapper-safety
+
+Unlike `review-reference-file` (item 9), `exclude-paths` is wrapper-safe and is listed under "Safe to expose for product repos" in [Extending the wrapper's input surface](../README.md#extending-the-wrappers-input-surface). A same-repo PR author who edits a wrapper consumer's `exclude-paths` value can only narrow the diff sent to OpenAI; the validation rules above prevent broadening, escape, and pathspec-magic abuse. The action's safety guarantees (key isolation, write-permission split, allowlist enforcement) do not depend on which files appear in the diff.
+
+**How to apply:** see the [Production workflow example](../README.md#production-workflow-example) for an `exclude-paths` snippet adapted to common ecosystems, and the [Prepare action inputs](../README.md#prepare-action-inputs) table for the input definition.
 
 ## Why fork PRs are skipped
 
@@ -167,7 +207,7 @@ The fork-and-wrap adoption path documented in [Adopting in enterprise environmen
 - A company fork **does not replace SHA pinning.** The fork still references composite-action `uses:` lines internally, and those references must be pinned to immutable SHAs inside the fork — including the transitive `openai/codex-action` pin. Forking moves the trust dependency from the upstream maintainer account to the fork's maintainers, but it does not eliminate the SHA-pinning discipline.
 - The `allow-users` allowlist **does not replace fork gating.** `allow-users` controls *who* may trigger the prepare step among same-repo PR authors; the same-repo gate from item 3 controls *which PRs* the workflow runs on at all. A workflow with `allow-users` set but without the same-repo gate still runs on fork PRs (and fails noisily, see above). Both controls are required.
 
-Wrapper consumers calling the org-internal reusable workflow inherit items 2, 3, 4, 5, 6, 7, and the wrapper-side half of item 9 from the wrapper's own workflow definition. Items 1 and 8, plus the direct-consumer half of item 9, remain the wrapper maintainer's responsibility.
+Wrapper consumers calling the org-internal reusable workflow inherit items 2, 3, 4, 5, 6, 7, 8, and the wrapper-side half of item 9 from the wrapper's own workflow definition. Item 1, plus the direct-consumer half of item 9, remains the wrapper maintainer's responsibility. Item 10 is optional in either model; product repos may set `exclude-paths` directly on the wrapper invocation when the wrapper exposes that input as a `workflow_call` parameter.
 
 ## Audit summary
 

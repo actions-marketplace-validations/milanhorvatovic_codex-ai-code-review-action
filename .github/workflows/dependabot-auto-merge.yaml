@@ -18,17 +18,17 @@ permissions:
 # already-merged PR).
 #
 # `cancel-in-progress` is conditional. We cancel for `opened`/`reopened`/`synchronize`
-# (the new event has fresher PR state to merge against) and for the `trust-boundary`
-# labeled event (which means "stop the merge now"). We do NOT cancel for non-trust-
-# boundary `labeled` events: Dependabot adds `dependencies`/`release: patch`/etc. labels
-# in rapid succession right after opening a PR, and those replacement runs skip both
-# `rebuild-dist` and `auto-merge` per their `if:` guards — so canceling the in-flight
-# merge run for them would leave the PR stranded with neither a synchronous merge nor
-# auto-merge enabled. Letting them queue behind the in-flight run is harmless (they're
-# no-ops on the merge path) and avoids the stall.
+# (the new event has fresher PR state to merge against) and for either security-review
+# `labeled` event (`trust-boundary` or `security-review-required`, both meaning "stop the
+# merge now"). We do NOT cancel for non-security-review `labeled` events: Dependabot adds
+# `dependencies`/`release: patch`/etc. labels in rapid succession right after opening a
+# PR, and those replacement runs skip both `rebuild-dist` and `auto-merge` per their `if:`
+# guards — so canceling the in-flight merge run for them would leave the PR stranded with
+# neither a synchronous merge nor auto-merge enabled. Letting them queue behind the
+# in-flight run is harmless (they're no-ops on the merge path) and avoids the stall.
 concurrency:
   group: ${{ github.workflow }}-pr-${{ github.event.pull_request.number }}
-  cancel-in-progress: ${{ github.event.action != 'labeled' || github.event.label.name == 'trust-boundary' }}
+  cancel-in-progress: ${{ github.event.action != 'labeled' || github.event.label.name == 'trust-boundary' || github.event.label.name == 'security-review-required' }}
 
 jobs:
   rebuild-dist:
@@ -65,61 +65,132 @@ jobs:
             echo "dist/ is already up to date; nothing to commit."
           fi
 
-      - name: Validate rebuild-dist configuration
+      # Mint a short-lived token from the `oss-automation-bot` GitHub App.
+      # Used to authenticate the GraphQL `createCommitOnBranch` mutation
+      # that lands the rebuilt dist/ on the PR branch. Replaces a prior
+      # multi-secret + GPG-import flow that required maintaining a PAT, a
+      # GPG key, and committer-identity variables across both the Actions
+      # and Dependabot secret stores.
+      #
+      # Why GraphQL rather than plain `git push`: pushes from an
+      # App-installation token over HTTPS authenticate the push but do
+      # NOT sign the locally-created commit, so a `git push` path would
+      # land rebuild-dist commits as Unverified. `createCommitOnBranch`
+      # creates the commit server-side under the authenticated App
+      # identity; GitHub signs commits authored via this mutation on
+      # behalf of the App, so rebuild-dist commits stay Verified just
+      # like under the prior GPG flow — without any GPG key or
+      # committer-identity configuration to manage.
+      #
+      # `create-github-app-token` fails the job if
+      # `vars.AUTOMATION_CLIENT_ID` or `secrets.AUTOMATION_PRIVATE_KEY` is
+      # missing, which subsumes the prior `Validate rebuild-dist
+      # configuration` step's role. The private key must exist in BOTH
+      # the Actions and Dependabot secrets stores — Dependabot-triggered
+      # workflows cannot read Actions secrets and vice versa, the same
+      # dual-store pattern documented for `CODEOWNER_APPROVER_TOKEN` in
+      # `dependabot-reconciler.yaml`.
+      #
+      # The token is narrowed to `contents: write` only. Omitting
+      # `permission-*` inputs would mint with the App installation's
+      # full permission set; the sole consumer of this token is the
+      # `createCommitOnBranch` mutation, which requires `contents:
+      # write`, so broader scopes are avoidable privilege expansion in
+      # a Dependabot-context job.
+      - name: Mint oss-automation-bot token for dist push
         if: steps.dist.outputs.changed == 'true'
-        env:
-          REBUILD_TOKEN: ${{ secrets.DEPENDABOT_REBUILD_TOKEN }}
-          GPG_PRIVATE_KEY: ${{ secrets.DEPENDABOT_GPG_PRIVATE_KEY }}
-          COMMITTER_NAME: ${{ vars.DEPENDABOT_GIT_COMMITTER_NAME }}
-          COMMITTER_EMAIL: ${{ vars.DEPENDABOT_GIT_COMMITTER_EMAIL }}
-        run: |
-          missing=0
-          if [ -z "$REBUILD_TOKEN" ]; then
-            echo "::error::Dependabot secret DEPENDABOT_REBUILD_TOKEN is missing — required to push the rebuilt dist/ back to the PR. Create a fine-grained PAT scoped to this repo (Contents: read/write) and store it as DEPENDABOT_REBUILD_TOKEN under Settings → Secrets and variables → Dependabot."
-            missing=1
-          fi
-          if [ -z "$GPG_PRIVATE_KEY" ]; then
-            echo "::error::Dependabot secret DEPENDABOT_GPG_PRIVATE_KEY is missing — required to sign the rebuilt dist/ commit so it satisfies main's required_signatures rule. Export an armored sign-only GPG subkey ('gpg --armor --export-secret-subkeys <subkey-id>!') and store it as DEPENDABOT_GPG_PRIVATE_KEY under Settings → Secrets and variables → Dependabot."
-            missing=1
-          fi
-          if [ -z "$COMMITTER_NAME" ]; then
-            echo "::error::Repo variable DEPENDABOT_GIT_COMMITTER_NAME is missing — required as the committer name for the signed rebuild-dist commit. Set it under Settings → Secrets and variables → Actions → Variables."
-            missing=1
-          fi
-          if [ -z "$COMMITTER_EMAIL" ]; then
-            echo "::error::Repo variable DEPENDABOT_GIT_COMMITTER_EMAIL is missing — required as the committer email for the signed rebuild-dist commit. It must match a UID on the imported GPG key and a verified email on the GitHub account that owns the public key. Set it under Settings → Secrets and variables → Actions → Variables."
-            missing=1
-          fi
-          if [ "$missing" -ne 0 ]; then
-            exit 1
-          fi
-
-      - name: Import GPG key
-        if: steps.dist.outputs.changed == 'true'
-        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          gpg_private_key: ${{ secrets.DEPENDABOT_GPG_PRIVATE_KEY }}
-          git_user_signingkey: true
-          git_commit_gpgsign: true
-          git_config_global: true
-          git_committer_name: ${{ vars.DEPENDABOT_GIT_COMMITTER_NAME }}
-          git_committer_email: ${{ vars.DEPENDABOT_GIT_COMMITTER_EMAIL }}
+          client-id: ${{ vars.AUTOMATION_CLIENT_ID }}
+          private-key: ${{ secrets.AUTOMATION_PRIVATE_KEY }}
+          permission-contents: write
 
-      - name: Commit and push dist
+      - name: Commit dist as oss-automation-bot via createCommitOnBranch
         if: steps.dist.outputs.changed == 'true'
         env:
-          REBUILD_TOKEN: ${{ secrets.DEPENDABOT_REBUILD_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           BRANCH: ${{ github.event.pull_request.head.ref }}
           REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          git add dist/
-          git commit -m "chore: rebuild dist after dependency update"
-          git push "https://x-access-token:${REBUILD_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/${BRANCH}"
+          set -euo pipefail
+          # Stage everything under dist/ first. The detect step above uses
+          # `git status --porcelain dist/`, which reports untracked entries
+          # (`??`) — a brand-new ncc chunk or a fresh `licenses.txt` flips
+          # `changed=true`. A plain `git diff HEAD -- dist/` does NOT list
+          # untracked files, so without staging those new files would
+          # silently drop out of `fileChanges` and the mutation would land
+          # an incomplete dist/ (or reject the call outright). `git add -A
+          # dist/` lifts untracked additions into the index so the cached
+          # diff classifies them as `A`.
+          git add -A dist/
+
+          # Walk the staged diff under dist/ and split into additions/deletions.
+          # `--no-renames` keeps the status set to {A,M,D} (rename status
+          # `R` would produce a three-column record requiring different
+          # parsing); `-z` makes records null-terminated so paths with
+          # spaces never break the split. dist/ paths don't contain
+          # spaces today, but the safe form costs nothing and removes a
+          # future foot-gun.
+          #
+          # `git diff -z --name-status` emits paired NUL-separated fields
+          # per record: `<status>\0<path>\0` (NOT a single tab-joined
+          # field). Read two paired NUL-terminated fields per iteration.
+          additions='[]'
+          deletions='[]'
+          while IFS= read -r -d '' status && IFS= read -r -d '' path; do
+            case "$status" in
+              A|M)
+                # createCommitOnBranch's `FileAddition.contents` is a
+                # Base64String; `-w0` keeps the encoded blob single-line
+                # so jq's `--arg` substitution and the final JSON payload
+                # both stay valid.
+                content_b64=$(base64 -w0 "$path")
+                additions=$(jq --arg p "$path" --arg c "$content_b64" \
+                  '. + [{path: $p, contents: $c}]' <<<"$additions")
+                ;;
+              D)
+                deletions=$(jq --arg p "$path" '. + [{path: $p}]' <<<"$deletions")
+                ;;
+              *)
+                echo "::error::Unexpected git status '$status' for '$path'."
+                exit 1
+                ;;
+            esac
+          done < <(git diff --cached --name-status --no-renames -z -- dist/)
+
+          # Single GraphQL mutation. The App-installation token
+          # authenticates the call so GitHub signs the resulting commit
+          # server-side — the rebuild-dist commit lands Verified with
+          # author/committer = oss-automation-bot[bot], no local
+          # committer config required. `expectedHeadOid` pins the parent
+          # commit: if a maintainer pushed to the branch during the
+          # build, the mutation fails rather than silently overwriting
+          # their work. The resulting `synchronize` event is attributed
+          # to the App identity (not GITHUB_TOKEN), so downstream
+          # required-check workflows fire on the new head — matching
+          # the property the reconciler exploits via `gh pr
+          # update-branch`, and avoiding the GITHUB_TOKEN anti-loop
+          # suppression that would otherwise leave stale checks blocking
+          # auto-merge under `strict_required_status_checks_policy: true`.
+          jq -n \
+            --arg repo "$REPO" \
+            --arg branch "$BRANCH" \
+            --arg head_oid "$HEAD_SHA" \
+            --argjson additions "$additions" \
+            --argjson deletions "$deletions" \
+            '{
+              query: "mutation($r:String!,$b:String!,$h:GitObjectID!,$a:[FileAddition!]!,$d:[FileDeletion!]!){createCommitOnBranch(input:{branch:{repositoryNameWithOwner:$r,branchName:$b},message:{headline:\"chore: rebuild dist after dependency update\"},fileChanges:{additions:$a,deletions:$d},expectedHeadOid:$h}){commit{oid}}}",
+              variables: {r: $repo, b: $branch, h: $head_oid, a: $additions, d: $deletions}
+            }' \
+            | gh api graphql --input - --silent
 
   auto-merge:
     # Skip on label events — auto-merge is set once at open/synchronize time. If a maintainer later
-    # applies the trust-boundary label, the disable-auto-merge-on-trust-boundary job below handles
-    # revoking the previously-enabled auto-merge.
+    # applies either security-review label (trust-boundary or security-review-required), the
+    # disable-auto-merge-on-security-review job below handles revoking the previously-enabled
+    # auto-merge.
     if: >-
       github.event.action != 'labeled' &&
       github.event.pull_request.user.login == 'dependabot[bot]' &&
@@ -179,13 +250,18 @@ jobs:
           ' <<<"$UPDATED_JSON")
           echo "update-type=$effective" >> "$GITHUB_OUTPUT"
 
-      # See CONTRIBUTING.md → Trust-boundary changes for the policy.
+      # See CONTRIBUTING.md → Security-review-required changes for the policy.
       # Two guards coexist intentionally:
       #   1. Exclude-by-name: skip auto-merge for any (possibly grouped) bump that includes
-      #      `openai/codex-action`. Extend this list when a new trust-boundary dependency
+      #      `openai/codex-action`. The exclude list is intentionally action-level
+      #      dependencies only — packages whose code runs inside the workflow with secrets
+      #      in scope. Passive deps (e.g. `actions/checkout`) are not on the list because
+      #      their bumps are caught by the criteria-based label guards. Extend this list
+      #      when a new action-level trust-boundary or containment-mechanism dependency
       #      is added to the repo.
       #   2. Label guard: skip auto-merge for any PR a maintainer has manually labeled
-      #      `trust-boundary`, even if the dep is not yet on the exclude list.
+      #      `trust-boundary` or `security-review-required`, even if the dep is not yet
+      #      on the exclude list.
       # The `if:` clauses below evaluate against the event payload captured at workflow start.
       # That payload can be stale by the time this step runs (label applied during the run).
       # The runtime checks inside `run:` close that TOCTOU race — see the comments there.
@@ -203,8 +279,9 @@ jobs:
           steps.effective.outputs.update-type != 'version-update:semver-major'
           && !contains(steps.metadata.outputs.dependency-names, 'openai/codex-action')
           && !contains(github.event.pull_request.labels.*.name, 'trust-boundary')
+          && !contains(github.event.pull_request.labels.*.name, 'security-review-required')
         env:
-          GH_TOKEN: ${{ secrets.DEPENDABOT_APPROVE_TOKEN }}
+          GH_TOKEN: ${{ secrets.CODEOWNER_APPROVER_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         # This step is intentionally fail-open: any failure (missing token, revoked PAT,
         # insufficient PAT scope, transient GitHub API error, malformed response) emits a
@@ -224,19 +301,19 @@ jobs:
           set +e
           set -uo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::warning::DEPENDABOT_APPROVE_TOKEN is not set — skipping auto-approval. The merge step will fall back to GitHub auto-merge, which waits for a manual code-owner approval. Configure a fine-grained PAT scoped to this repo (Pull requests: write) belonging to a code-owner and store it under Settings → Secrets and variables → Dependabot → DEPENDABOT_APPROVE_TOKEN."
+            echo "::warning::CODEOWNER_APPROVER_TOKEN is not set in the Dependabot secret store — skipping auto-approval. The merge step will fall back to GitHub auto-merge, which waits for a manual code-owner approval. Configure a fine-grained PAT scoped to this repo (Pull requests: write) belonging to a code-owner and mirror the same value under Settings → Secrets and variables → Dependabot → CODEOWNER_APPROVER_TOKEN (Dependabot-triggered workflows cannot read Actions secrets, so the Actions-store copy used by dependabot-reconciler.yaml is not visible here)."
             exit 0
           fi
-          if ! label_state=$(gh pr view "$PR_URL" --json labels --jq 'any(.labels[]; .name == "trust-boundary")'); then
-            echo "::warning::Failed to query trust-boundary label state; skipping auto-approval. The merge step will fall back to GitHub auto-merge."
+          if ! label_state=$(gh pr view "$PR_URL" --json labels --jq 'any(.labels[]; .name == "trust-boundary" or .name == "security-review-required")'); then
+            echo "::warning::Failed to query security-review label state; skipping auto-approval. The merge step will fall back to GitHub auto-merge."
             exit 0
           fi
           if [ "$label_state" = "true" ]; then
-            echo "trust-boundary label is now present (applied after workflow start); skipping auto-approval."
+            echo "security-review label (trust-boundary or security-review-required) is now present (applied after workflow start); skipping auto-approval."
             exit 0
           fi
-          if ! gh pr review --approve --body "Auto-approved by the Dependabot Auto-Merge workflow (non-major, non-trust-boundary update)." "$PR_URL"; then
-            echo "::warning::Failed to post auto-approval review (likely a revoked or insufficiently-scoped DEPENDABOT_APPROVE_TOKEN, or a transient GitHub API error). The merge step will fall back to GitHub auto-merge."
+          if ! gh pr review --approve --body "Auto-approved by the Dependabot Auto-Merge workflow (non-major, no security-review label)." "$PR_URL"; then
+            echo "::warning::Failed to post auto-approval review (likely a revoked or insufficiently-scoped CODEOWNER_APPROVER_TOKEN, or a transient GitHub API error). The merge step will fall back to GitHub auto-merge."
             exit 0
           fi
 
@@ -252,52 +329,57 @@ jobs:
       #      `gh pr view --json reviewDecision == APPROVED`, which is GitHub's own answer
       #      to "is this PR sufficiently approved per the ruleset?" — including the code-
       #      owner-review requirement. This is stricter than checking whether the auto-
-      #      approval step exited 0: if `DEPENDABOT_APPROVE_TOKEN` belongs to a non-CODEOWNER
+      #      approval step exited 0: if `CODEOWNER_APPROVER_TOKEN` belongs to a non-CODEOWNER
       #      identity, `gh pr review --approve` succeeds but `reviewDecision` stays
       #      `REVIEW_REQUIRED` and we correctly fall back instead of failing on the merge.
-      #   2. Fail-closed label query. The trust-boundary label is queried via a tri-state
-      #      helper that returns `unknown` on `gh pr view` errors. Pre- and post-poll
-      #      `unknown` exits the job with `::error::` rather than arming auto-merge: if
-      #      the label was actually present and the reactive disable job already ran, an
-      #      armed auto-merge here cannot be backstopped. The same fail-closed treatment
-      #      runs after `arm_auto_merge` enables auto-merge — `unknown` triggers a
-      #      defensive `gh pr merge --disable-auto` and a non-zero return.
+      #   2. Fail-closed label query. Both security-review labels (trust-boundary,
+      #      security-review-required) are queried together via a tri-state helper that
+      #      returns `unknown` on `gh pr view` errors. Pre- and post-poll `unknown` exits
+      #      the job with `::error::` rather than arming auto-merge: if either label was
+      #      actually present and the reactive disable job already ran, an armed auto-merge
+      #      here cannot be backstopped. The same fail-closed treatment runs after
+      #      `arm_auto_merge` enables auto-merge — `unknown` triggers a defensive
+      #      `gh pr merge --disable-auto` and a non-zero return.
       #   3. Concurrency-safe. Workflow-level concurrency cancels overlapping runs on the
       #      same PR, so the `gh pr checks --watch` loop here is interrupted cleanly when
       #      a new commit lands rather than racing a fresh run.
       #
-      # Trust-boundary handling: the label is re-checked twice on the synchronous path —
-      # once before polling (so we don't waste minutes waiting on a PR we won't merge) and
-      # again immediately before the merge (closing the race where a maintainer applies the
-      # label while checks run). The fallback path keeps the original post-enable revert.
+      # Security-review handling: the label state is re-checked twice on the synchronous
+      # path — once before polling (so we don't waste minutes waiting on a PR we won't
+      # merge) and again immediately before the merge (closing the race where a maintainer
+      # applies a label while checks run). The fallback path keeps the original post-enable
+      # revert.
       #
       # A residual TOCTOU window remains on the synchronous path — between the second
       # label re-check and `gh pr merge --squash`, a few milliseconds of inter-command
       # latency. This is no worse than the prior `--auto` design's window between auto-
       # merge enable and the reactive `--disable-auto` revert. Closing it atomically
-      # requires elevating the trust-boundary policy to a required status check so the
+      # requires elevating the security-review policy to a required status check so the
       # ruleset itself refuses the merge — left as future work.
       - name: Wait for required checks, then squash-merge
         if: >-
           steps.effective.outputs.update-type != 'version-update:semver-major'
           && !contains(steps.metadata.outputs.dependency-names, 'openai/codex-action')
           && !contains(github.event.pull_request.labels.*.name, 'trust-boundary')
+          && !contains(github.event.pull_request.labels.*.name, 'security-review-required')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
           set -euo pipefail
 
-          # Tri-state trust-boundary label query.  Returns "true" / "false" on a successful
-          # gh response and "unknown" if the API call fails (rate limit, network, 5xx).
-          # Callers handle "unknown" by failing closed — see the helper-level comments
-          # below for the policy reasoning. Stderr is intentionally NOT redirected so the
-          # underlying gh failure (auth, rate limit, transient 5xx) lands in the workflow
-          # log; the downstream `unknown` error messages tell maintainers to investigate
-          # that output.
-          trust_boundary_state() {
+          # Tri-state security-review label query. Returns "true" / "false" on a
+          # successful gh response and "unknown" if the API call fails (rate limit,
+          # network, 5xx). "true" means at least one of the two security-review labels
+          # (`trust-boundary`, `security-review-required`) is present; either label
+          # blocks auto-merge identically. Callers handle "unknown" by failing closed
+          # — see the helper-level comments below for the policy reasoning. Stderr is
+          # intentionally NOT redirected so the underlying gh failure (auth, rate limit,
+          # transient 5xx) lands in the workflow log; the downstream `unknown` error
+          # messages tell maintainers to investigate that output.
+          security_review_state() {
             local result
-            if ! result=$(gh pr view "$PR_URL" --json labels --jq 'any(.labels[]; .name == "trust-boundary")'); then
+            if ! result=$(gh pr view "$PR_URL" --json labels --jq 'any(.labels[]; .name == "trust-boundary" or .name == "security-review-required")'); then
               echo "unknown"
               return
             fi
@@ -335,10 +417,10 @@ jobs:
             esac
           }
 
-          # Enable GitHub auto-merge, verify the call took, and revert it if the
-          # trust-boundary label is now present (or its state has become unknown).
+          # Enable GitHub auto-merge, verify the call took, and revert it if either
+          # security-review label is now present (or its state has become unknown).
           # Returns 0 on full success, 1 on any verification or revert failure (with
-          # appropriate `::error::` annotations). Disable-auto on a trust-boundary PR
+          # appropriate `::error::` annotations). Disable-auto on a security-review PR
           # is a hard failure: silently logging it as a warning would let auto-merge
           # stay armed on a PR the policy says must remain manual, which is a worse
           # outcome than a noisy workflow failure. Same fail-closed treatment for the
@@ -349,18 +431,18 @@ jobs:
             if ! verify_auto_merge_or_terminal; then
               return 1
             fi
-            case "$(trust_boundary_state)" in
+            case "$(security_review_state)" in
               true)
-                echo "trust-boundary label is now present; reverting auto-merge."
+                echo "security-review label (trust-boundary or security-review-required) is now present; reverting auto-merge."
                 if ! gh pr merge --disable-auto "$PR_URL"; then
-                  echo "::error::Failed to disable auto-merge on a trust-boundary PR. The PR may still merge automatically when conditions are met, bypassing the policy that requires manual maintainer review. Investigate immediately."
+                  echo "::error::Failed to disable auto-merge on a security-review PR. The PR may still merge automatically when conditions are met, bypassing the policy that requires manual maintainer review. Investigate immediately."
                   return 1
                 fi
                 return 1 ;;
               unknown)
-                echo "::error::Failed to verify trust-boundary state after arming auto-merge. Defensively disabling auto-merge to avoid a possible policy bypass — if the label is actually present, we cannot rely on the reactive disable job to backstop us (it only fires on the labeled event, which may have already run before this point)."
+                echo "::error::Failed to verify security-review label state after arming auto-merge. Defensively disabling auto-merge to avoid a possible policy bypass — if a security-review label is actually present, we cannot rely on the reactive disable job to backstop us (it only fires on the labeled event, which may have already run before this point)."
                 if ! gh pr merge --disable-auto "$PR_URL"; then
-                  echo "::error::Failed to defensively disable auto-merge on a possibly-trust-boundary PR. Investigate immediately."
+                  echo "::error::Failed to defensively disable auto-merge on a possibly security-review-required PR. Investigate immediately."
                 fi
                 return 1 ;;
             esac
@@ -369,29 +451,29 @@ jobs:
 
           # Used by the unhappy paths (review not APPROVED, label state unknown). Enables
           # auto-merge as a graceful fallback so a later code-owner approval can finish the
-          # merge; the reactive disable-auto-merge-on-trust-boundary job below remains a
-          # backstop for trust-boundary applications that land after this point.
+          # merge; the reactive disable-auto-merge-on-security-review job below remains a
+          # backstop for security-review label applications that land after this point.
           fall_back_to_auto_merge() {
-            echo "::warning::$1; enabling GitHub auto-merge so a later code-owner approval (and/or the reactive disable-auto-merge job for trust-boundary) can finish or halt the merge."
+            echo "::warning::$1; enabling GitHub auto-merge so a later code-owner approval (and/or the reactive disable-auto-merge job for security-review labels) can finish or halt the merge."
             if ! arm_auto_merge; then
               exit 1
             fi
             exit 0
           }
 
-          # Pre-poll trust-boundary check. `unknown` fails closed: if we can't see the
-          # label state and it's actually present, the reactive disable-auto-merge job
-          # may have already run on the labeled event before we reach here — arming
-          # auto-merge with `fall_back_to_auto_merge` would leave it active on a PR the
-          # policy says must be manual. A workflow failure is recoverable via re-run; a
-          # silent policy bypass isn't.
-          case "$(trust_boundary_state)" in
+          # Pre-poll security-review check. `unknown` fails closed: if we can't see the
+          # label state and a security-review label is actually present, the reactive
+          # disable-auto-merge job may have already run on the labeled event before we
+          # reach here — arming auto-merge with `fall_back_to_auto_merge` would leave it
+          # active on a PR the policy says must be manual. A workflow failure is
+          # recoverable via re-run; a silent policy bypass isn't.
+          case "$(security_review_state)" in
             true)
-              echo "trust-boundary label is now present (applied after workflow start); skipping merge."
+              echo "security-review label (trust-boundary or security-review-required) is now present (applied after workflow start); skipping merge."
               exit 0
               ;;
             unknown)
-              echo "::error::Failed to query trust-boundary label state pre-poll. Refusing to arm auto-merge: if the label is actually present, the reactive disable-auto-merge-on-trust-boundary job may have already run before we'd arm auto-merge here, leaving an unrevoked merge on a PR the policy says must be manual. Investigate the gh pr view error above and re-run."
+              echo "::error::Failed to query security-review label state pre-poll. Refusing to arm auto-merge: if a security-review label is actually present, the reactive disable-auto-merge-on-security-review job may have already run before we'd arm auto-merge here, leaving an unrevoked merge on a PR the policy says must be manual. Investigate the gh pr view error above and re-run."
               exit 1
               ;;
           esac
@@ -414,15 +496,15 @@ jobs:
             exit 1
           fi
 
-          # Post-poll trust-boundary re-check. Same fail-closed treatment as the pre-poll
+          # Post-poll security-review re-check. Same fail-closed treatment as the pre-poll
           # check — see the comment there for the policy-bypass reasoning.
-          case "$(trust_boundary_state)" in
+          case "$(security_review_state)" in
             true)
-              echo "trust-boundary label was applied while waiting for checks; skipping merge."
+              echo "security-review label (trust-boundary or security-review-required) was applied while waiting for checks; skipping merge."
               exit 0
               ;;
             unknown)
-              echo "::error::Failed to query trust-boundary label state post-poll. Refusing to arm auto-merge: see the pre-poll comment above for why a possibly-present trust-boundary label cannot be safely backstopped from this point. Investigate the gh pr view error above and re-run."
+              echo "::error::Failed to query security-review label state post-poll. Refusing to arm auto-merge: see the pre-poll comment above for why a possibly-present security-review label cannot be safely backstopped from this point. Investigate the gh pr view error above and re-run."
               exit 1
               ;;
           esac
@@ -449,21 +531,22 @@ jobs:
             fall_back_to_auto_merge "Synchronous squash merge failed (mergeability may have changed since the check wait completed — base branch advanced, transient API error, or branch is BEHIND)"
           fi
 
-  # Reactive disable: if a maintainer applies the `trust-boundary` label after auto-merge has
-  # already been enabled by the auto-merge job above, the label-guard `if:` on that step only
-  # prevents re-enabling — it does not revoke a previously-enabled auto-merge. This job runs on
-  # the `labeled` pull_request event and explicitly disables auto-merge so the PR stays open
-  # for manual maintainer review and merging.
+  # Reactive disable: if a maintainer applies either security-review label
+  # (`trust-boundary` or `security-review-required`) after auto-merge has already been
+  # enabled by the auto-merge job above, the label-guard `if:` on that step only prevents
+  # re-enabling — it does not revoke a previously-enabled auto-merge. This job runs on
+  # the `labeled` pull_request event and explicitly disables auto-merge so the PR stays
+  # open for manual maintainer review and merging.
   #
   # A previously-posted auto-approval review (from the approve step above) is intentionally
   # left in place. Disabling auto-merge is sufficient to stop the automatic merge; the
   # ruleset's `dismiss_stale_reviews_on_push: true` will clear the bot review on the next push,
   # and the maintainer who applied the label can dismiss it manually if they want a clean
   # review state before re-evaluating.
-  disable-auto-merge-on-trust-boundary:
+  disable-auto-merge-on-security-review:
     if: >-
       github.event.action == 'labeled' &&
-      github.event.label.name == 'trust-boundary' &&
+      (github.event.label.name == 'trust-boundary' || github.event.label.name == 'security-review-required') &&
       github.event.pull_request.user.login == 'dependabot[bot]' &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest

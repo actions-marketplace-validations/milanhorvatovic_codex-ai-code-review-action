@@ -7,9 +7,11 @@ import { getPrepareInputs } from "../config/inputs.js";
 import { isAuthorAllowed } from "../core/allowlist.js";
 import { buildChunkMatrix, splitDiff } from "../core/diff.js";
 import { assemblePrompt } from "../core/prompt.js";
+import { ExcludePathsError, parseExcludePaths } from "./excludePaths.js";
 import {
   ReviewReferenceFileError,
-  resolveReviewReferenceContent,
+  resolveReviewReferenceFromBase,
+  resolveReviewReferenceFromWorkspace,
 } from "./referenceFile.js";
 import { getPullRequestContext } from "../github/context.js";
 import { buildDiff, fetchBaseSha } from "../github/git.js";
@@ -34,11 +36,22 @@ async function run(): Promise<void> {
 
   core.setOutput("skipped", "false");
 
+  let excludePaths: string[];
+  try {
+    excludePaths = parseExcludePaths(inputs.excludePathsRaw);
+  } catch (error) {
+    if (error instanceof ExcludePathsError) {
+      core.setFailed(`Invalid exclude-paths: ${error.message}`);
+      return;
+    }
+    throw error;
+  }
+
   let diff: string;
   core.startGroup("Building PR diff");
   try {
     await fetchBaseSha(prContext.baseSha, inputs.githubToken);
-    diff = await buildDiff(prContext.baseSha, prContext.headSha);
+    diff = await buildDiff(prContext.baseSha, prContext.headSha, excludePaths);
     fs.mkdirSync(CODEX_DIR, { recursive: true });
     fs.writeFileSync(DIFF_FILE, diff);
   } catch (error) {
@@ -79,13 +92,28 @@ async function run(): Promise<void> {
   let referenceContent = defaultReference;
   if (referenceFilePath) {
     try {
-      referenceContent = resolveReviewReferenceContent(
-        referenceFilePath,
-        process.env.GITHUB_WORKSPACE ?? process.cwd(),
-      );
+      if (inputs.reviewReferenceSource === "base") {
+        referenceContent = await resolveReviewReferenceFromBase(
+          referenceFilePath,
+          prContext.baseSha,
+        );
+      } else {
+        referenceContent = resolveReviewReferenceFromWorkspace(
+          referenceFilePath,
+          process.env.GITHUB_WORKSPACE ?? process.cwd(),
+        );
+      }
     } catch (error) {
       if (error instanceof ReviewReferenceFileError) {
         core.setFailed(`Invalid review-reference-file: ${error.message}`);
+        return;
+      }
+      if (inputs.reviewReferenceSource === "base") {
+        core.setFailed(
+          `Failed to read review-reference-file at base SHA: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
         return;
       }
       throw error;

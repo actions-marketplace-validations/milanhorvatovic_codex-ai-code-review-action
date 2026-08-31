@@ -25,9 +25,11 @@ describe("getPrepareInputs", () => {
     mockGetInput.mockImplementation((name: string) => {
       const inputs: Record<string, string> = {
         "allow-users": "user1,user2",
+        "exclude-paths": "dist/**\n*.lock",
         "github-token": "ghp-token",
         "max-chunk-bytes": "100000",
         "review-reference-file": ".github/codex/reference.md",
+        "review-reference-source": "base",
       };
       return inputs[name] ?? "";
     });
@@ -36,8 +38,36 @@ describe("getPrepareInputs", () => {
 
     expect(result.githubToken).toBe("ghp-token");
     expect(result.allowedUsers).toBe("user1,user2");
+    expect(result.excludePathsRaw).toBe("dist/**\n*.lock");
     expect(result.maxChunkBytes).toBe(100000);
     expect(result.reviewReferenceFile).toBe(".github/codex/reference.md");
+    expect(result.reviewReferenceSource).toBe("base");
+  });
+
+  it("defaults review-reference-source to 'workspace' when omitted", () => {
+    mockGetInput.mockImplementation(() => "");
+
+    const result = getPrepareInputs();
+    expect(result.reviewReferenceSource).toBe("workspace");
+  });
+
+  it("accepts 'workspace' as the explicit review-reference-source", () => {
+    mockGetInput.mockImplementation((name: string) =>
+      name === "review-reference-source" ? "workspace" : "",
+    );
+
+    const result = getPrepareInputs();
+    expect(result.reviewReferenceSource).toBe("workspace");
+  });
+
+  it("rejects review-reference-source values other than 'workspace' or 'base'", () => {
+    mockGetInput.mockImplementation((name: string) =>
+      name === "review-reference-source" ? "head" : "",
+    );
+
+    expect(() => getPrepareInputs()).toThrow(
+      "Input 'review-reference-source' must be 'workspace' or 'base' (got 'head').",
+    );
   });
 
   it("masks the GitHub token", () => {
@@ -70,8 +100,19 @@ describe("getPrepareInputs", () => {
 });
 
 describe("getPublishInputs", () => {
+  // Mirror the boolean-input defaults declared in publish/action.yaml so that
+  // `mockBooleans({})` simulates "input omitted, action default applied" rather
+  // than "input set to false." Tests that need a specific value still pass it
+  // explicitly via the `values` argument.
+  const ACTION_YAML_BOOLEAN_DEFAULTS: Record<string, boolean> = {
+    "fail-on-missing-chunks": true,
+    "retain-findings": false,
+  };
+
   function mockBooleans(values: Record<string, boolean>): void {
-    mockGetBooleanInput.mockImplementation((name: string) => values[name] ?? false);
+    mockGetBooleanInput.mockImplementation(
+      (name: string) => values[name] ?? ACTION_YAML_BOOLEAN_DEFAULTS[name] ?? false,
+    );
   }
 
   it("parses all inputs correctly", () => {
@@ -230,14 +271,14 @@ describe("getPublishInputs", () => {
     expect(result.failOnMissingChunks).toBe(false);
   });
 
-  it("defaults fail-on-missing-chunks to false when omitted (action.yaml default)", () => {
+  it("defaults fail-on-missing-chunks to true when omitted (action.yaml default)", () => {
     mockGetInput.mockImplementation((name: string) =>
       name === "github-token" ? "token" : "",
     );
     mockBooleans({});
 
     const result = getPublishInputs();
-    expect(result.failOnMissingChunks).toBe(false);
+    expect(result.failOnMissingChunks).toBe(true);
   });
 
   it("throws for non-integer retain-findings-days when retain-findings is enabled", () => {

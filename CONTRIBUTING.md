@@ -124,9 +124,22 @@ To run the same lint locally, pick whichever path fits your platform:
 
 - **Native package managers.** macOS: `brew install actionlint shellcheck`. Linux: install `shellcheck` from your distro and `actionlint` from the [upstream releases](https://github.com/rhysd/actionlint/releases). Windows: `scoop install actionlint shellcheck`.
 
-## Trust-boundary changes
+## Security-review-required changes
 
-Changes that affect data destinations, forwarding, telemetry, auth scopes, or what callers must trust require explicit release-note treatment so adopters who have already hardened their workflow can re-review.
+Changes that affect what data crosses the action's trust boundaries, or the runtime structure that keeps those boundaries enforced, require explicit security review and dedicated release-note treatment so adopters who have already hardened their workflow can re-review.
+
+The policy covers two complementary classes:
+
+- **Trust-boundary changes** — changes to *what* data crosses what boundary (data destinations, prompt contents, telemetry, permission scopes, artifact contents, exit-code contract, transitive dep flips touching any of these).
+- **Containment-mechanism changes** — changes to *how* those boundaries stay enforced (event triggers, secret scoping, model-execution sandboxing, reference-file behavior, workflow job-boundary moves).
+
+Each class has its own label and CHANGELOG callout; both feed the same Dependabot enforcement and release-gate sign-off discipline. The label names predate the umbrella section name and are kept stable for automation and search.
+
+When in doubt, treat the change as security-review-required and apply the label that fits best (or both). A PR may carry both labels if it touches both classes; both callouts then appear in the CHANGELOG.
+
+This applies to every PR regardless of author — maintainer, outside contributor, or AI-assisted — including Dependabot PRs that bump a transitive SHA falling under the criteria below. Maintainers apply the label on Dependabot's behalf during review.
+
+### Trust-boundary changes
 
 A change is trust-boundary-affecting if it:
 
@@ -135,43 +148,56 @@ A change is trust-boundary-affecting if it:
 - adds any analytics, logging, or telemetry that leaves the GitHub Actions runner;
 - changes the permissions required by the action (new `permissions:` scope, new token usage);
 - alters the artifact contents in a way that changes what callers must trust;
+- changes the default exit-code contract — a scenario the action previously exited 0 on now exits non-zero (or vice versa), including via a default-input flip;
 - updates a transitive dependency that itself changes any of the above (e.g. updating the `openai/codex-action` SHA pin in `review/action.yaml`).
 
-When in doubt, treat the change as trust-boundary-affecting.
+PRs in this class:
 
-PRs with such changes must:
+- carry the `trust-boundary` label;
+- include a `## Security-review impact` paragraph in the PR description (see [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md));
+- get a `### ⚠️ Trust boundary change` CHANGELOG callout at release time (see [Release process](#release-process) step 2b).
 
-- be labeled `trust-boundary`;
-- include a "Trust boundary impact" paragraph in the PR description (see [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md));
-- get a dedicated CHANGELOG callout at release time (see [Release process](#release-process) step 2b).
+### Containment-mechanism changes
 
-This applies to every PR regardless of author — maintainer, outside contributor, or AI-assisted — including Dependabot PRs that bump a transitive SHA falling under the criteria above. Maintainers apply the label on Dependabot's behalf during review.
+A change is containment-mechanism-affecting if it:
+
+- adds or expands a workflow event trigger that runs the workflow with secrets in scope against PR-controlled content (notably `pull_request_target`, `workflow_run`, or `issue_comment`). The existing `pull_request` trigger is the safe baseline and is unchanged unless explicitly noted.
+- changes how secrets are scoped, passed, named, or exposed to jobs — for example, moving a secret between environment-scoped and repo-scoped, renaming a secret, adding a job that receives a secret it did not previously receive, or widening which steps within a job see it via `env:`.
+- alters model-execution sandboxing, including any `openai/codex-action` input that controls network access, filesystem access, or process execution under the model (today `sandbox: read-only` at [`review/action.yaml`](review/action.yaml)).
+- changes the validation, resolution, or sourcing of `review-reference-file` or `review-reference-source`. The `review-reference-source` value is parsed and validated in [`src/config/inputs.ts`](src/config/inputs.ts); the path-shape rules and per-mode resolvers live in [`src/prepare/referenceFile.ts`](src/prepare/referenceFile.ts); base-mode resolution sources the file at the PR base SHA via `git --literal-pathspecs ls-tree` (entry mode; `--literal-pathspecs` is a git global option and must precede the subcommand) and `git cat-file blob` (content), with `git cat-file -s` enforcing the size cap before any content is buffered. A change that *adds new content paths into the prompt itself* belongs in the trust-boundary class above; a change to *how an existing input is validated or sourced* belongs here.
+- moves prompt assembly, model execution, or PR publishing across the existing `prepare` / `review` / `publish` job-boundary. Today: `prepare` carries no API key with `contents: read`; `review` carries the API key with `contents: read`; `publish` carries no API key with `contents: read` plus `pull-requests: write`. Any change that crosses these scopes belongs here.
+
+PRs in this class:
+
+- carry the `security-review-required` label;
+- include a `## Security-review impact` paragraph in the PR description (see [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md));
+- get a `### 🔒 Containment-mechanism change` CHANGELOG callout at release time (see [Release process](#release-process) step 2b).
 
 ### Dependabot enforcement
 
-The auto-merge workflow at [`.github/workflows/dependabot-auto-merge.yaml`](.github/workflows/dependabot-auto-merge.yaml) carries three layers of enforcement:
+The auto-merge workflow at [`.github/workflows/dependabot-auto-merge.yaml`](.github/workflows/dependabot-auto-merge.yaml) carries three layers of enforcement, each gated on either of the two security-review labels (`trust-boundary`, `security-review-required`):
 
-- **Exclude-by-name guard** in the auto-merge step's `if:` expression: `!contains(steps.metadata.outputs.dependency-names, 'openai/codex-action')` — auto-merge is never enabled for any (possibly grouped) Dependabot PR that includes `openai/codex-action`. Extend this clause when a new trust-boundary dependency is added to the repo.
-- **Label guard** — fast-path `if:` clause `!contains(github.event.pull_request.labels.*.name, 'trust-boundary')` plus runtime re-checks inside the auto-merge step. The `if:` evaluates against the event payload captured at workflow start, which can be stale by the time the step runs; the runtime pre-check (`gh pr view --json labels`) bails out if the label is now present, and a runtime post-check after `gh pr merge --auto` reverts the enable if the label was applied during the brief enable window. Both checks together close the TOCTOU race that the `if:` alone cannot.
-- **Reactive disable job** triggered on the `labeled` pull_request event: if a maintainer applies the `trust-boundary` label *after* auto-merge has already been enabled and committed (i.e., outside the runtime post-check window above), the `disable-auto-merge-on-trust-boundary` job runs `gh pr merge --disable-auto` to revoke it.
+- **Exclude-by-name guard** in the auto-merge step's `if:` expression: `!contains(steps.metadata.outputs.dependency-names, 'openai/codex-action')` — auto-merge is never enabled for any (possibly grouped) Dependabot PR that includes `openai/codex-action`. The exclude list is intentionally action-level dependencies only — packages whose code runs inside the workflow with secrets in scope. Passive deps (e.g. `actions/checkout`) are not on the list because their bumps are handled by the criteria-based label guards. Extend this clause when a new action-level trust-boundary or containment-mechanism dependency is added to the repo.
+- **Label guard** — fast-path `if:` clauses that exclude both `trust-boundary` and `security-review-required` from the labels payload, plus runtime re-checks inside the auto-merge step. The `if:` evaluates against the event payload captured at workflow start, which can be stale by the time the step runs; the runtime pre-check (`gh pr view --json labels`) bails out if either label is now present, and a runtime post-check after `gh pr merge --auto` reverts the enable if either label was applied during the brief enable window. Both checks together close the TOCTOU race that the `if:` alone cannot.
+- **Reactive disable job** triggered on the `labeled` pull_request event: if a maintainer applies either security-review label *after* auto-merge has already been enabled and committed (i.e., outside the runtime post-check window above), the `disable-auto-merge-on-security-review` job runs `gh pr merge --disable-auto` to revoke it.
 
-All three coexist intentionally. The exclude list is the declarative defense (fail-closed for known dependencies); the label guard's runtime checks close the TOCTOU race during the auto-merge step itself; the reactive disable job catches PRs labeled later in the PR's lifecycle. Removing any layer weakens the policy.
+All three coexist intentionally. The exclude list is the declarative defense (fail-closed for known action-level dependencies); the label guard's runtime checks close the TOCTOU race during the auto-merge step itself; the reactive disable job catches PRs labeled later in the PR's lifecycle. Removing any layer weakens the policy.
 
 #### Auto-approval
 
-The default-branch ruleset on `main` requires one approving code-owner review before merge. `GITHUB_TOKEN` cannot approve PRs and Dependabot cannot approve its own PRs, so without an additional approver auto-merge would never complete. To close that gap, the auto-merge job posts an approving review *before* enabling auto-merge, gated by the same three trust-boundary guards above (semver-major bumps, the `openai/codex-action` exclude, and the `trust-boundary` label).
+The default-branch ruleset on `main` requires one approving code-owner review before merge. `GITHUB_TOKEN` cannot approve PRs and Dependabot cannot approve its own PRs, so without an additional approver auto-merge would never complete. To close that gap, the auto-merge job posts an approving review *before* enabling auto-merge, gated by the same set of guards above (semver-major bumps, the `openai/codex-action` exclude, and either security-review label).
 
-The approval is posted using a fine-grained PAT belonging to a code-owner, stored as the Dependabot secret **`DEPENDABOT_APPROVE_TOKEN`**. The PAT must be:
+The approval is posted using a fine-grained PAT belonging to a code-owner, stored under the canonical name **`CODEOWNER_APPROVER_TOKEN`** in **both** the Dependabot secret store (consumed by the auto-merge workflow's auto-approval step in Dependabot context) and the Actions secret store (consumed by `dependabot-reconciler.yaml`'s re-approval step, which runs from `push`/`schedule`/`workflow_run` triggers and cannot see Dependabot secrets). The same PAT value lives under both store entries — workflows triggered by Dependabot do not have access to Actions secrets and vice versa, so the dual-store mirror is structural. The PAT must be:
 
 - Scoped to this repository.
 - Granted `Pull requests: write` permission (sufficient to submit a review).
 - Owned by a user listed in [`.github/CODEOWNERS`](.github/CODEOWNERS), so the review counts toward the code-owner requirement.
 
-Configure under **Settings → Secrets and variables → Dependabot → New secret**. Workflows triggered by Dependabot do not have access to Actions secrets, so the value must live under the Dependabot scope.
+Configure under **Settings → Secrets and variables → Dependabot → New secret** *and* under **Settings → Secrets and variables → Actions → New repository secret**, using the same `CODEOWNER_APPROVER_TOKEN` name and the same PAT value in both places. Rotate both copies together when the PAT expires.
 
 When the secret is unset, the approval step emits a warning and exits cleanly — auto-merge is still enabled, but the PR waits for a manual approving review.
 
-Auto-approval reviews carry the marker body `Auto-approved by the Dependabot Auto-Merge workflow (...)` so they are easy to identify in the PR review list. If a maintainer later applies the `trust-boundary` label, the reactive disable job revokes auto-merge but does not dismiss the bot review; the ruleset's `dismiss_stale_reviews_on_push: true` will clear it on the next push, and the maintainer can dismiss it manually before re-evaluating.
+Auto-approval reviews carry the marker body `Auto-approved by the Dependabot Auto-Merge workflow (...)` so they are easy to identify in the PR review list. If a maintainer later applies either security-review label, the reactive disable job revokes auto-merge but does not dismiss the bot review; the ruleset's `dismiss_stale_reviews_on_push: true` will clear it on the next push, and the maintainer can dismiss it manually before re-evaluating.
 
 ## Release process
 
@@ -180,9 +206,9 @@ The release gate checklist at [`docs/release-gate.md`](docs/release-gate.md) is 
 ### Automated release (default)
 
 1. Trigger `prepare-release.yaml` via the GitHub UI (`Actions → Prepare Release → Run workflow`). Optionally pass an explicit `version` (e.g. `2.1.0` or `2.1.0-rc.1`); leave empty to compute from the `release: <level>` labels of merged PRs since the last non-pre-release tag.
-2. The workflow opens a PR titled `release: v<X.Y.Z>` against `main` containing the `package.json` bump, the matching `package-lock.json` bump (top-level `version` and `packages[""].version` only — no dependency tree resolution), and the new `CHANGELOG.md` entry, all in the same commit. Review it like any other PR. Re-running the workflow for the same target version updates the existing release branch and PR in place; the bot refuses to force-push if any non-bot commits are present on the release branch. The PR body includes a release-gate sign-off checklist that points back at [`docs/release-gate.md`](docs/release-gate.md); the checklist text is hard-coded in `buildPrBody` (`scripts/prepare-release.ts`), so when the gate's section structure changes update both files in the same PR.
+2. The workflow opens a PR titled `v<X.Y.Z>` against `main` containing the `package.json` bump, the matching `package-lock.json` bump (top-level `version` and `packages[""].version` only — no dependency tree resolution), and the new `CHANGELOG.md` entry, all in the same commit. Review it like any other PR. Re-running the workflow for the same target version updates the existing release branch and PR in place; the bot refuses to force-push if any non-bot commits are present on the release branch. The PR body includes a release-gate sign-off checklist that points back at [`docs/release-gate.md`](docs/release-gate.md); the checklist text is hard-coded in `buildPrBody` (`scripts/prepare-release.ts`), so when the gate's section structure changes update both files in the same PR.
    - **2b. Complete the release gate (pre-merge items).** Walk [`docs/release-gate.md`](docs/release-gate.md) against the merge candidate: run the validation block, the dist-reproducibility check, and the manual security regression checks; resolve every pre-merge gate item to either a `Verified by:` line or a `Waived:` line with a tracked follow-up. Fill the rollup into the release PR description so reviewers see the sign-off before approving the squash-merge. The post-tag gate item (evidence-zip upload) is handled in step 5b after the GitHub Release is created and the self-pin refresh PR has merged.
-3. Squash-merge the release PR. The `release-on-merge.yaml` workflow validates the merge commit (lint, typecheck, tests, `verify-dist`, and consistency between the branch ref, `package.json`, `package-lock.json`, and the top `CHANGELOG.md` section), then tags it with `v<X.Y.Z>` and pushes the tag automatically. If validation fails, no tag is created.
+3. Squash-merge the release PR. The `release-on-merge.yaml` workflow validates the merge commit by invoking the `verify-release` composite ([`.github/actions/verify-release/action.yaml`](.github/actions/verify-release/action.yaml)) — the single source of truth for release validation, also consumed by `release.yaml` at tag push and by the on-demand `verify-release.yaml` verifier — then tags it with `v<X.Y.Z>` and pushes the tag automatically. If validation fails, no tag is created. To exercise the gate against an arbitrary commit without merging a release PR, trigger `verify-release.yaml` from `Actions → Verify release → Run workflow` with the SHA and bare semver under test; the workflow checks out that SHA into a separate `candidate/` worktree so the verifier definition comes from the selected workflow ref, not from the candidate checkout.
 4. The tag push triggers `release.yaml`, which creates the GitHub Release with notes extracted from `CHANGELOG.md`, force-updates the major version tag (skipped for pre-releases), and opens a follow-up PR refreshing SHA-pinned self-references in `README.md` and `.github/workflows/codex-review.yaml` to point at the new tag's SHA (skipped for pre-releases).
 5. Squash-merge the self-pin refresh PR. (Skipped for pre-releases — `release.yaml` does not open a refresh PR for `vX.Y.Z-rc.N`.)
    - **5b. Attach the gate evidence zip after all post-tag items are verified.** Wait until every post-tag gate item — including any release-specific post-tag items the maintainer recorded under [Release-specific items](docs/release-gate.md#release-specific-items) — has been signed off. For final releases the self-pin refresh PR merge in step 5 is part of this set; for pre-releases (`vX.Y.Z-rc.N`) the refresh PR is intentionally skipped, so the gate proceeds as soon as the GitHub Release exists and any RC-specific post-tag items are signed off. Then package the filled gate (`gate.md`), captured validation output (`validation.log`, `dist-diff.txt`, `audit.json`), and any manual-check notes (`manual-checks.md`) into `release-gate-v<X.Y.Z>.zip` and upload to the GitHub Release: `gh release upload v<X.Y.Z> release-gate-v<X.Y.Z>.zip --clobber`. The `--clobber` flag overwrites an existing asset of the same name so retries (partial-upload recovery, evidence regeneration after a late post-tag verification) stay idempotent. See [Archiving the gate](docs/release-gate.md#archiving-the-gate).
@@ -195,15 +221,19 @@ Use this path when `prepare-release.yaml` is broken or an urgent hotfix needs cu
 
 1. Update `version` in `package.json`, then bump `package-lock.json` to the same version at both the top-level `version` and `packages[""].version`. Do not run `npm install --package-lock-only` or `npm version` for this — they re-resolve the dependency tree and would cause silent transitive bumps in a release-prep commit. A `jq`-based or hand edit of just those two lines is correct. The `tests.yaml` workflow rejects any PR where the two files disagree.
 2. Update `CHANGELOG.md` with the release date and any new entries.
-   - **2b. Trust-boundary callout.** If the release contains any PRs labeled `trust-boundary`, add a dedicated subsection to the CHANGELOG entry:
+   - **2b. Security-review callouts.** If the release contains any PRs labeled `trust-boundary` or `security-review-required`, add the matching dedicated subsection(s) to the CHANGELOG entry. A PR carrying both labels gets a bullet under both callouts:
 
      ```markdown
      ### ⚠️ Trust boundary change
 
-     - <what changed> — <why> — <what callers should re-review>
+     - <what data-flow / permission / contract changed> — <why> — <what callers should re-review>
+
+     ### 🔒 Containment-mechanism change
+
+     - <what containment mechanism changed> — <why> — <what callers should re-audit>
      ```
 
-     Applies to releases cut after this section lands; historical entries are not rewritten.
+     Applies to releases cut after each callout's section lands; historical entries are not rewritten. The `### 🔒 Containment-mechanism change` callout applies forward from the release in which this policy ships.
 3. Rebuild dist: `npm run build`.
    - **3b. Sync cross-doc SHA and version references.** When the canonical pin in `action.yaml`, `prepare/action.yaml`, `publish/action.yaml`, or `review/action.yaml` changes — or when any release bumps a third-party Action — update every other reference to that pin in the same release: `README.md` (including the "Adopting in enterprise environments" section), examples, and any other docs. The unified-pins rule (one SHA + tag per third-party Action across the entire repo) is enforced by CI on every PR and push to `main` by `.github/workflows/verify-action-pins.yaml`. The `ratchet-lint` job rejects any `uses:` that is not pinned to a full commit SHA, and the `verify-doc-pins` job (running `npm run verify:doc-pins`) fails when any tracked Markdown file references a third-party Action with a SHA or tag that drifts from the canonical pin in YAML. If either job fails, fix the listed files; do not bypass the check. The release-time sweep is now "verify CI passes" rather than a manual grep.
    - **3c. Complete the release gate (pre-merge items).** Before merging the release commit, walk [`docs/release-gate.md`](docs/release-gate.md) against the candidate commit: run the validation block, the dist-reproducibility check, and the manual security regression checks; resolve every pre-merge gate item to either `Verified by:` or `Waived:` with a tracked follow-up. The post-tag gate item (evidence-zip upload) is handled in step 7b after the GitHub Release is created and the self-pin refresh PR has merged.
@@ -221,11 +251,11 @@ Use this path when `prepare-release.yaml` is broken or an urgent hotfix needs cu
 >
 > The release workflow runs on the tag push and creates the GitHub Release from the same `CHANGELOG.md` section.
 >
-> If the workflow is unavailable and you need to create the release by hand, extract the notes and pass them explicitly — do **not** use `--generate-notes`, which bypasses the CHANGELOG:
+> If the workflow is unavailable and you need to create the release by hand, extract the notes and pass them explicitly — do **not** use `--generate-notes`, which bypasses the CHANGELOG. Pass `--title vx.y.z` explicitly so the release header is pinned to the tag; without it, GitHub's web UI falls back to the tagged commit's subject for the release name, which couples the release page heading to whatever the squash-merge commit subject ended up being.
 >
 > ```bash
 > npx tsx scripts/extract-changelog-section.ts x.y.z > /tmp/notes.md
-> gh release create vx.y.z --notes-file /tmp/notes.md
+> gh release create vx.y.z --title vx.y.z --notes-file /tmp/notes.md
 > ```
 
 ## License

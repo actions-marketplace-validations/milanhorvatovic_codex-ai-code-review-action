@@ -11,6 +11,30 @@
 
 PR diffs and metadata leave the runner only via two destinations: **GitHub** (PR context, posting the review, artifact storage) and **OpenAI** (via the SHA-pinned [`openai/codex-action`](https://github.com/openai/codex-action) invoked from `review/action.yaml`). This repository operates no maintainer-owned backend, proxy, analytics service, or telemetry pipeline that receives diffs. See the [Trust model](../README.md#trust-model) section in the README for the full statement.
 
+## Reviewing security-relevant changes
+
+Maintainers gate two complementary classes of change behind explicit security review and dedicated CHANGELOG callouts so adopters who have already hardened their workflow can re-audit before pulling a new SHA.
+
+**Trust-boundary changes** — *what* data crosses what boundary:
+
+- outbound HTTP destinations (any new host or external API call);
+- data sent to OpenAI via the prompt (new fields, larger excerpts, new metadata);
+- analytics, logging, or telemetry that leaves the GitHub Actions runner;
+- `permissions:` required by the action (new scope, new token usage);
+- artifact contents that change what callers must trust;
+- default exit-code contract (a scenario the action previously exited 0 on now exits non-zero, or vice versa);
+- transitive dependency SHA flips that touch any of the above (notably `openai/codex-action`).
+
+**Containment-mechanism changes** — *how* those boundaries stay enforced:
+
+- event trigger surface, especially adding or expanding `pull_request_target`, `workflow_run`, or `issue_comment` (the existing `pull_request` trigger is the safe baseline);
+- secret scoping, passing, naming, or job-level exposure;
+- model-execution sandboxing, including any `openai/codex-action` input that controls network access, filesystem access, or process execution under the model;
+- `review-reference-file` and `review-reference-source` validation, resolution, or sourcing;
+- workflow job-boundary moves between `prepare`, `review`, and `publish` that cross a permission or secret scope.
+
+PRs in either class carry the matching label (`trust-boundary`, `security-review-required`, or both), get a dedicated CHANGELOG callout at release time, and require maintainer security-review sign-off recorded against the release gate. The full criteria, label rules, Dependabot enforcement, and CHANGELOG callout shapes live in [`CONTRIBUTING.md` → Security-review-required changes](../CONTRIBUTING.md#security-review-required-changes); this section is the auditor-facing summary.
+
 ## Reporting a Vulnerability
 
 If you discover a security vulnerability in this project, please report it responsibly:
@@ -29,17 +53,35 @@ For consumers wiring this action into a workflow, the auditable checklist of req
 
 ### Safe `review-reference-file` values
 
-The `review-reference-file` input names a path inside the checked-out workspace, which on a `pull_request` run contains PR-controlled content. To prevent a PR from coercing the prepare step into reading runner-local files outside the workspace (e.g. `/proc/self/environ`) or runner-managed git state (e.g. `.git/config`) and forwarding their contents to OpenAI in the prompt, the value must satisfy every rule below. Anything else fails closed before the file is read:
+The `review-reference-file` input names a workspace-relative path inside the consumer repository. In workspace mode the path is resolved against the runner's checked-out workspace, so any regular file under `$GITHUB_WORKSPACE` that satisfies the rules below can be read; in base mode the path must be a tracked file at the PR base SHA. Which mode applies is governed by `review-reference-source` — see [Safe `review-reference-source` modes](#safe-review-reference-source-modes) below. The path-shape rules below apply to every value of `review-reference-source`. They prevent a PR from coercing the prepare step into reading runner-local files outside the workspace (e.g. `/proc/self/environ`) or runner-managed git state (e.g. `.git/config`) and forwarding their contents to OpenAI in the prompt:
 
 - workspace-relative — absolute paths (POSIX or Windows-style), backslashes, and NUL bytes are rejected;
 - contained — the resolved path stays under `$GITHUB_WORKSPACE` after POSIX normalization (`../...` is rejected);
-- not under `.git` — paths whose first component is `.git` (any casing) are rejected, because the contents of the runner's `.git` directory are runtime state, not PR content;
-- a regular file — directories, FIFOs, devices, and any kind of symbolic link (leaf or ancestor directory) are rejected;
-- bounded — at most 64 KiB.
+- not under `.git` — paths whose first component is `.git` (any casing) are rejected, because the contents of the runner's `.git` directory are runtime state, not PR content.
 
-A workspace-relative path that meets these rules (for example, `.github/codex/review-reference.md`) still represents PR-controlled content: a PR can legitimately edit the reference and steer the review prompt, and any other workspace file the PR is allowed to commit can be referenced too. Tamper-resistant policy reads from the base branch are tracked in [issue #97](https://github.com/milanhorvatovic/codex-ai-code-review-action/issues/97); until that ships, treat workspace-mode references as PR-authored policy.
+In addition to the shared rules, **workspace mode** rejects:
+
+- any kind of symbolic link (leaf or ancestor directory);
+- non-regular files (directories, FIFOs, devices);
+- on-disk size over 64 KiB.
+
+A workspace-mode path that meets these rules (for example, `.github/codex/review-reference.md`) still represents PR-controlled content: a same-repo PR can legitimately edit the reference and steer the review prompt, and any other workspace file the PR is allowed to commit can be referenced too. Set `review-reference-source: base` to lock the policy against in-PR edits.
 
 Adopters on `<= v2.0.x` should either upgrade to a release that contains this hardening or stop passing `review-reference-file` until they do.
+
+### Safe `review-reference-source` modes
+
+The `review-reference-source` input controls *where* `review-reference-file` is read from. It accepts exactly two values; anything else fails closed at input parsing.
+
+- `workspace` (default) — the file is resolved against the runner's checked-out workspace at the PR head SHA. This is convenient for PR-driven policy iteration but trusts every same-repo PR author to edit policy in the same PR.
+- `base` (recommended for less-trusted contributors and hard-coded in org-owned wrapper workflows; do not expose this input from a `workflow_call` wrapper as a caller-controlled toggle) — the file is read at the PR base SHA via `git --literal-pathspecs ls-tree` (for the tree-entry mode) and `git cat-file blob` (for the content). The `--literal-pathspecs` flag is a git global option and must precede the `ls-tree` subcommand; the implementation invokes git as `git --literal-pathspecs ls-tree -z --full-tree <sha> -- <path>`. The git form does not follow filesystem symlinks, so a PR cannot point the read at a runner-local secret by replacing the file with a symlink in the workspace. `--literal-pathspecs` keeps filenames containing pathspec metacharacters resolving to the exact validated path. The blob's size is queried via `git cat-file -s` and checked against the cap before any content is buffered. In addition to the shared path-shape rules, base mode rejects:
+  - tracked symbolic links (git mode `120000`) — returning the link target string as policy content would be a footgun;
+  - non-regular-file modes (notably submodules, mode `160000`);
+  - blobs whose returned content exceeds 64 KiB.
+
+Base-mode failures use the same `Invalid review-reference-file:` prefix when the input or tree shape is at fault. Git-shell failures (path absent at the base SHA, base SHA unreachable) surface with a distinct prefix `Failed to read review-reference-file at base SHA:` so input problems and git problems can be debugged separately.
+
+Base mode protects against in-PR edits, not against trusted maintainers merging policy changes through normal review — policy *content* still lives in the consumer repo and is controlled by whoever can land changes on the base branch.
 
 The three-job architecture splits responsibilities by permission scope:
 
@@ -60,7 +102,7 @@ This repository runs the action against its own pull requests via [`.github/work
 
 ## Release automation identity
 
-Release automation is performed by a dedicated GitHub App installed only on this repository. The App identity is `codex-review-action-release-bot[bot]` in audit logs and PR authorship.
+Release automation is performed by a dedicated GitHub App installed only on this repository. The App identity is `oss-release-bot[bot]` in audit logs and PR authorship.
 
 ### Permission scope
 
@@ -77,7 +119,7 @@ The App has no organization permissions, no user permissions, no webhook, and no
 
 App credentials are stored at the repo level (Settings → Secrets and variables → Actions):
 
-- `RELEASE_APP_ID` (variable) — the App's numeric ID. Not a secret; stored as a repo variable so workflows can reference it via `vars.RELEASE_APP_ID`.
+- `RELEASE_CLIENT_ID` (variable) — the App's OAuth Client ID. Not a secret; stored as a repo variable so workflows can reference it via `vars.RELEASE_CLIENT_ID` and pass it as the `client-id` input to `actions/create-github-app-token`.
 - `RELEASE_APP_PRIVATE_KEY` (secret) — the App's signing key. Release-automation workflows are expected to feed this into a token-minting Action (e.g. `actions/create-github-app-token`) to obtain short-lived installation tokens at runtime.
 
 GitHub App installation tokens expire automatically (one-hour default) and are scoped to the installation rather than to a specific workflow run, so a leaked token remains usable until expiry or explicit revocation. Release-automation workflows are expected to mint a token at job start and revoke it at job end (the default post-step behavior of `actions/create-github-app-token`); the App identity itself does not enforce that. Maintainers rotate the private key by generating a new one on the App settings page and replacing the secret value; old keys remain valid until manually revoked.
@@ -88,6 +130,8 @@ PRs opened by the default `GITHUB_TOKEN` do not trigger downstream workflows (a 
 
 ### Tag-creation gating
 
-`release-on-merge.yaml` is split into a `validate` job and a `tag` job. `validate` runs without the App token (only `contents: read` on `pull_request.merge_commit_sha`) and executes `verify-dist`, `npm run lint`, `npm run typecheck`, `npm test`, the `verify-lockfile-version` composite, and the branch-ref / `package.json` / `CHANGELOG.md` consistency checks. `tag` declares `needs: validate`, mints the App token, and pushes `vX.Y.Z`; a defensive `git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}"` check at the top of the tag-push step short-circuits with `exit 0` when the tag already exists, so re-runs do not flap. Both jobs carry the same merged-PR / release-branch guard for defense in depth, and the workflow-level `release-tag` concurrency group continues to serialize the validate→tag sequence and queue concurrent release PRs.
+`release-on-merge.yaml` is split into a `validate` job and a `tag` job. `validate` runs without the App token (only `contents: read` on `pull_request.merge_commit_sha`) and invokes the `verify-release` composite ([`.github/actions/verify-release/action.yaml`](actions/verify-release/action.yaml)), which is the single source of truth for the release validation sequence: semver input validation, the version-consistency check between the input version, `package.json`, and the top `CHANGELOG.md` section, `setup-node-deps`, `verify-dist`, `npm run lint`, `npm run typecheck`, `npm test`, and `verify-lockfile-version`. `tag` declares `needs: validate`, mints the App token, and pushes `vX.Y.Z`; a defensive `git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}"` check at the top of the tag-push step short-circuits with `exit 0` when the tag already exists, so re-runs do not flap. Both jobs carry the same merged-PR / release-branch guard for defense in depth, and the workflow-level `release-tag` concurrency group continues to serialize the validate→tag sequence and queue concurrent release PRs.
 
-Keeping `validate` token-free means a future change to validation that processes PR-derived content cannot leak App credentials. `release.yaml` is unchanged and continues to run the same validation a second time on tag push as a redundant post-tag defense before the GitHub Release is published.
+Keeping `validate` token-free means a future change to validation that processes PR-derived content cannot leak App credentials. `release.yaml` invokes the same `verify-release` composite a second time on tag push as a redundant post-tag defense before the GitHub Release is published, deriving its version input from `GITHUB_REF_NAME` instead of the merged PR's head ref.
+
+`verify-release.yaml` exposes the composite as a `workflow_dispatch` entry point that runs the same validation against an arbitrary `(sha, version)` pair from the Actions UI. It checks out the verifier definition separately from the candidate worktree and passes `working-directory: candidate`, so the candidate checkout cannot overwrite the verifier implementation selected for the run. It carries `contents: read` only — no App token, no write permissions, no tag side effects — and exists so the gate can be exercised end-to-end without merging a fake release PR or installing the release App on a scratch repo (which the App's single-installation invariant forbids).

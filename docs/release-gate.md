@@ -9,7 +9,7 @@ The CI pipeline already runs every check that can be automated. This gate is the
 The gate applies to both release paths documented in [`CONTRIBUTING.md`](../CONTRIBUTING.md#release-process). Pick the working surface that matches the path you are using:
 
 1. **Pick the working surface for the filled gate.**
-   - **Automated path (default).** Open the release PR created by `prepare-release.yaml`, titled `release: v<X.Y.Z>`. Its body is composed by `scripts/prepare-release.ts` and already includes a sign-off checklist that points back at this page; the release PR description is the working surface.
+   - **Automated path (default).** Open the release PR created by `prepare-release.yaml`, titled `v<X.Y.Z>`. Its body is composed by `scripts/prepare-release.ts` and already includes a sign-off checklist that points back at this page; the release PR description is the working surface.
    - **Manual path (fallback).** Create a local working copy of this page on the release branch (for example `release-gate-v<X.Y.Z>.md`) before merging the release commit. The local file is the working surface and ships in the evidence zip after tagging.
 2. Walk this page top to bottom against the merge candidate (the release branch's HEAD before the squash-merge or before the local merge to `main`). Every pre-merge item must end up either checked off (with a verified-by line) or explicitly waived (with a rationale). The post-tag item under [Archiving the gate](#archiving-the-gate) is completed after `release.yaml` creates the GitHub Release.
 3. Record the filled-in gate on the working surface picked in step 1 so the sign-off is visible before merging:
@@ -23,7 +23,7 @@ The PR body's link to this page is pinned to the repository's default branch (ty
 
 ## Required validation
 
-Run the full validation suite against the merge candidate (the release branch's HEAD before the squash-merge), on the Node version pinned in `package.json` (`engines.node`). The release-tag automation (`release-on-merge.yaml`) re-validates the merge commit with `npm run lint`, `npm run typecheck`, `npm test`, `verify-dist`, `verify-lockfile-version`, and the branch-vs-package-vs-CHANGELOG version-consistency check. `npm run verify:doc-pins` and `npm run verify:prose-style` run on every PR and push to `main` via their dedicated workflows but are not part of the release-tag job, so include them in this manual rerun to confirm the merge candidate's state. `npm audit` is maintainer-only and is the gate's advisory layer.
+Run the full validation suite against the merge candidate (the release branch's HEAD before the squash-merge), on the Node version pinned in `package.json` (`engines.node`). The release-tag automation (`release-on-merge.yaml`) re-validates the merge commit by invoking the `verify-release` composite ([`.github/actions/verify-release/action.yaml`](../.github/actions/verify-release/action.yaml)), which is the single source of truth for the validation sequence (semver input validation, the version-consistency check between the input version, `package.json`, and the top `CHANGELOG.md` section, `setup-node-deps`, `verify-dist`, lint, typecheck, tests, and `verify-lockfile-version`). `release.yaml` runs the same composite again on tag push as a redundant post-tag defense; the on-demand `verify-release.yaml` workflow exposes it for arbitrary `(sha, version)` pairs by checking out the verifier definition separately from the candidate worktree. `npm run verify:doc-pins` and `npm run verify:prose-style` run on every PR and push to `main` via their dedicated workflows but are not part of the `verify-release` composite, so include them in this manual rerun to confirm the merge candidate's state. `npm audit` is maintainer-only and is the gate's advisory layer.
 
 ```bash
 npm ci
@@ -57,7 +57,7 @@ A non-empty diff means the merge candidate ships a stale bundle or a `package.js
 
 ## Manual security regression checks
 
-These checks exercise the path-validation hardening landed in [`src/prepare/referenceFile.ts`](../src/prepare/referenceFile.ts) (PR [#98](https://github.com/milanhorvatovic/codex-ai-code-review-action/pull/98), closing issue [#89](https://github.com/milanhorvatovic/codex-ai-code-review-action/issues/89)) plus the prompt-artifact composition path. The unit suites in [`src/prepare/referenceFile.test.ts`](../src/prepare/referenceFile.test.ts) and [`src/prepare/main.test.ts`](../src/prepare/main.test.ts) cover them; running `npm test` against the merge candidate confirms the protections still bite. The cases are listed here as an audit checklist, not as a separate test harness.
+These checks exercise the path-validation hardening implemented in [`src/prepare/referenceFile.ts`](../src/prepare/referenceFile.ts) plus the prompt-artifact composition path. The unit suites in [`src/prepare/referenceFile.test.ts`](../src/prepare/referenceFile.test.ts) and [`src/prepare/main.test.ts`](../src/prepare/main.test.ts) cover them; running `npm test` against the merge candidate confirms the protections still bite. The cases are listed here as an audit checklist, not as a separate test harness.
 
 - `review-reference-file: /proc/self/environ` is rejected with `must be workspace-relative, not absolute` before any read happens. The unit covers this in the `rejects an absolute POSIX path` case.
 - `review-reference-file: ../outside.md` is rejected with `escapes the workspace` before any read happens. The unit covers this in the `rejects a path that escapes the workspace via '..'` case.
@@ -66,14 +66,15 @@ These checks exercise the path-validation hardening landed in [`src/prepare/refe
 
 If any of the unit cases above are missing from the test suite or are skipped on the merge candidate, the gate fails — re-add coverage before tagging.
 
-## Conditional base-mode checks
+## Base-mode regression checks
 
-Run these only if the release contains the `review-reference-source: base` mode (tracked in issue [#97](https://github.com/milanhorvatovic/codex-ai-code-review-action/issues/97)). Until that lands, mark the section waived with a rationale that names the tracked follow-up so the waiver passes the [Sign-off convention](#sign-off-convention) acceptance bar — for example: `Waived: \`review-reference-source: base\` not part of v<X.Y.Z>; tracked in issue #97, target release v<next-version>`.
+Run these for every release. The `review-reference-source: base` mode is part of the prepare action surface from v2.1.0 onward, and any release that touches the resolver, the input parser, or `src/github/git.ts` can regress one of the properties below.
 
-- A PR that edits `.github/codex/review-reference.md` does not alter the policy applied to its own review when `review-reference-source: base` is set on the workflow. The base-mode read pulls the policy from the PR's base SHA, not the head SHA, so in-PR edits do not steer the prompt.
-- A missing base-branch reference path fails fast with a clear diagnostic when `review-reference-source: base` is set. The error must name the missing path and the base SHA so a maintainer can identify whether the file was renamed, deleted, or never existed at the resolved base.
+- A PR that edits `.github/codex/review-reference.md` does not alter the policy applied to its own review when `review-reference-source: base` is set on the workflow. The base-mode read pulls the policy from the PR's base SHA, not the head SHA, so in-PR edits do not steer the prompt. Real-git coverage lives in [`src/prepare/referenceFile.integration.test.ts`](../src/prepare/referenceFile.integration.test.ts) (`returns the BASE-SHA content when the workspace copy diverges` and `returns the BASE-SHA content when a divergent commit advances HEAD`).
+- A missing base-branch reference path fails fast with a clear diagnostic when `review-reference-source: base` is set. The error must name the missing path and the base SHA so a maintainer can identify whether the file was renamed, deleted, or never existed at the resolved base. Covered in the integration suite (`rejects a path that does not exist at the base SHA with a diagnostic naming the SHA and path`).
+- A tracked symbolic link at the resolved path (git mode `120000`) is rejected at the resolver, not silently returned as the link target string. Covered in the integration suite (`rejects a tracked symbolic link committed at the base SHA`) and the unit suite in [`src/prepare/referenceFile.test.ts`](../src/prepare/referenceFile.test.ts) (`rejects a tracked symbolic link (mode 120000)`).
 
-Both checks should be exercised in a scratch PR against the merge candidate before sign-off, and the result captured in the gate evidence zip.
+The integration suite is part of `npm test` running against the merge candidate, so the gate's pre-merge validation block already verifies these properties. A scratch-PR exercise on the merge candidate is still recommended for the first two so the result lands in the evidence zip alongside the unit output.
 
 ## Release-specific items
 
@@ -101,12 +102,28 @@ Every line in this gate ends in one of two states:
 
 Acceptance bars:
 
-- **Before tagging.** Every pre-merge gate item (Required validation, Dist reproducibility, Manual security regression checks, Conditional base-mode checks, Release-specific items, Trust-boundary cross-reference) is verified or waived; every waiver names its follow-up; the maintainer cutting the tag has signed off on the rollup.
+- **Before tagging.** Every pre-merge gate item (Required validation, Dist reproducibility, Manual security regression checks, Base-mode regression checks, Release-specific items, Security-review-required cross-reference, Security-review sign-off) is verified or waived; every waiver names its follow-up; the maintainer cutting the tag has signed off on the rollup.
 - **After tagging.** The post-tag item ([Archiving the gate](#archiving-the-gate)) is verified once `release.yaml` has created the GitHub Release and the evidence zip has been uploaded. The release is not considered complete until this final item is signed off in the release PR thread or evidence record.
 
-## Trust-boundary cross-reference
+## Security-review-required cross-reference
 
-If the release contains any PR labeled `trust-boundary` that also contributes a release level (i.e. not `release: skip`), the CHANGELOG must include the dedicated `### ⚠️ Trust boundary change` callout per the [Release process / Trust-boundary changes](../CONTRIBUTING.md#trust-boundary-changes) rule in `CONTRIBUTING.md`. Skipped PRs do not appear in CHANGELOG entries, so a `trust-boundary` label on a `release: skip` PR (e.g. release-prep or internal infra) does not by itself trigger the callout requirement. The release PR's CHANGELOG diff is the source of truth — the gate does not re-list the trust-boundary policy here, only confirms it was applied.
+If the release contains any PR labeled `trust-boundary` or `security-review-required` that also contributes a release level (i.e. not `release: skip`), the CHANGELOG must include the matching dedicated callout(s) per the [Release process / Security-review-required changes](../CONTRIBUTING.md#security-review-required-changes) rule in `CONTRIBUTING.md`:
+
+- a PR labeled `trust-boundary` requires a `### ⚠️ Trust boundary change` subsection with a bullet for that PR;
+- a PR labeled `security-review-required` requires a `### 🔒 Containment-mechanism change` subsection with a bullet for that PR;
+- a PR carrying both labels appears as a bullet under both callouts.
+
+Skipped PRs do not appear in CHANGELOG entries, so either label on a `release: skip` PR (e.g. release-prep or internal infra) does not by itself trigger a callout requirement. The release PR's CHANGELOG diff is the source of truth — the gate does not re-list the policy here, only confirms it was applied.
+
+## Security-review sign-off
+
+Every PR in this release labeled `trust-boundary` or `security-review-required` is listed below with a Verified-by line confirming the security review actually happened. This is separate from normal PR approval — the reviewer walked the criteria list in [`CONTRIBUTING.md` → Security-review-required changes](../CONTRIBUTING.md#security-review-required-changes), classified the surface(s) touched, and judged the change.
+
+| # | PR | Class | Surfaces touched | State |
+|---|---|---|---|---|
+| 1 | _#PR_ | _`trust-boundary` / `security-review-required` / both_ | _e.g. data sent to OpenAI; secret scoping_ | _`Verified by: <maintainer> — <YYYY-MM-DD>` or `Waived: <rationale + tracked follow-up>`_ |
+
+If the release contains no PRs in either class, replace the example row with `_None — release contains no security-review-required changes._` and add a Verified-by line so the section is not left ambiguously empty.
 
 ## Archiving the gate
 

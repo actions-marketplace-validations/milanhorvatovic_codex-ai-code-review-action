@@ -12,15 +12,15 @@
   "description": "AI-powered code review GitHub Action using OpenAI Codex",
   "devDependencies": {
     "@eslint/js": "10.0.1",
-    "@types/node": "25.6.0",
-    "@vitest/coverage-v8": "4.1.5",
+    "@types/node": "25.9.2",
+    "@vitest/coverage-v8": "4.1.8",
     "esbuild": "0.28.0",
-    "eslint": "10.3.0",
-    "tsx": "4.21.0",
+    "eslint": "10.4.1",
+    "tsx": "4.22.4",
     "typescript": "6.0.3",
-    "typescript-eslint": "8.59.1",
-    "vite": "8.0.10",
-    "vitest": "4.1.5"
+    "typescript-eslint": "8.60.1",
+    "vite": "8.0.16",
+    "vitest": "4.1.8"
   },
   "engines": {
     "node": "24.14.1"
@@ -44,5 +44,5 @@
     "verify:doc-pins": "tsx scripts/verify-doc-pins.ts",
     "verify:prose-style": "tsx scripts/verify-prose-style.ts"
   },
-  "version": "2.1.0-rc.1"
+  "version": "2.1.0"
 }
